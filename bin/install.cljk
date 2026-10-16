@@ -59,24 +59,51 @@
                 :script (.join path root "bin" script-name)
                 :config-file (.resolve path config-file)
                 :working-dir root})
-        resolver (when (true? (get-in config [:dns :enabled?]))
-                   (launchd/resolver-file {:tailnet (:tailnet config)
-                                           :port (get-in config [:dns :port])}))]
+        dns-enabled? (true? (get-in config [:dns :enabled?]))
+        _ (when (and dns-enabled? (not (seq (:tailnet config))))
+            (throw (js/Error. "DNS requires a non-empty :tailnet")))
+        resolver-file (when (seq (:tailnet config))
+                        (launchd/resolver-file {:tailnet (:tailnet config)
+                                                :port (get-in config [:dns :port])}))
+        resolver (when dns-enabled? resolver-file)]
     (if write?
-      (do (.writeFileSync fs (launchd/plist-path label) plist)
-          (when resolver
-            (.mkdirSync fs "/etc/resolver" #js {:recursive true})
-            (.writeFileSync fs (:path resolver) (:content resolver)))
-          (println (str "wrote " (launchd/plist-path label)
-                        (when resolver (str " and " (:path resolver)))))
-          (println "now run, as root:")
-          (doseq [cmd (launchd/install-commands label)]
-            (println (str "  " (kotoba.lang.text/join " " cmd)))))
+      (let [stat (when resolver-file
+                   (try
+                     (.lstatSync fs (:path resolver-file))
+                     (catch :default error
+                       (if (= "ENOENT" (.-code error)) nil (throw error)))))
+            safe-file? (and stat (.isFile stat) (not (.isSymbolicLink stat)))
+            current-content (when safe-file?
+                              (.readFileSync fs (:path resolver-file) "utf8"))
+            action (launchd/resolver-action dns-enabled? resolver-file
+                                           current-content)
+            _ (when (and (= :write action) stat (not safe-file?))
+                (throw (js/Error. "resolver path exists and is not a regular file")))
+            _ (.writeFileSync fs (launchd/plist-path label) plist)
+            removed-resolver?
+            (case action
+              :write (do (.mkdirSync fs "/etc/resolver" #js {:recursive true})
+                         (.writeFileSync fs (:path resolver) (:content resolver))
+                         false)
+              :remove (do (.unlinkSync fs (:path resolver-file)) true)
+              false)]
+        (println (str "wrote " (launchd/plist-path label)
+                      (when resolver (str " and " (:path resolver)))
+                      (when removed-resolver?
+                        (str "; removed " (:path resolver-file)))))
+        (when-not resolver
+          (println "resolver cleanup only removes the exact file generated for this node"))
+        (println "now run, as root:")
+        (doseq [cmd (launchd/install-commands label)]
+          (println (str "  " (kotoba.lang.text/join " " cmd)))))
       (do (println (str ";; " (launchd/plist-path label)))
           (println plist)
           (when resolver
             (println (str ";; " (:path resolver)))
             (println (:content resolver)))
+          (when (and resolver-file (not resolver))
+            (println (str ";; on --write, remove " (:path resolver-file)
+                            " only if it still matches this generated resolver")))
           (println ";; privileged steps:")
           (doseq [cmd (launchd/install-commands label)]
             (println (str ";;   " (kotoba.lang.text/join " " cmd))))

@@ -177,12 +177,15 @@
   ([agent-handle config client emit]
    (attach agent-handle config client emit (atom (fn [_] nil))))
   ([agent-handle config client emit refresh-ref]
+   (attach agent-handle config client emit refresh-ref resolve-underlay))
+  ([agent-handle config client emit refresh-ref resolve-underlay-fn]
    (let [socket-path (prepare config)
         last-hosts (atom nil)
         last-resolution-at (atom 0)
         host-addresses (atom {})
         last-routes (atom nil)
         underlay-guard (atom nil)
+        resolution-generation (atom 0)
         refresh-underlay
           (fn [force?]
             (let [state @(:state agent-handle)
@@ -195,47 +198,50 @@
                   refresh-dns? (>= (- now @last-resolution-at) 60000)]
               (when (and @client @underlay-guard
                          (or force? changed? routes-changed? refresh-dns?))
-                ;; A changed DNS answer or peer candidate invalidates the old
-                ;; host-to-route proof until the extension acknowledges the
-                ;; refreshed exclusions.
-                (udp/allow-underlay-hosts!
-                 (get @(:state agent-handle) :sock) [] {})
-                (reset! last-hosts hosts)
-                (reset! last-routes routes)
-                (reset! last-resolution-at now)
-                (-> (resolve-underlay hosts)
-                    (.then (fn [snapshot]
-                             (when @client
-                               (let [snapshot (assoc snapshot :routes
-                                                     (mapv (fn [route]
-                                                             {:family (:route/family route)
-                                                              :prefix (:route/prefix route)
-                                                              :bits (:route/bits route)})
-                                                           routes))]
-                               (udp/allow-underlay-hosts!
-                                (get @(:state agent-handle) :sock) [] {})
-                               (reset! host-addresses (:host-addresses snapshot))
-                               (write-underlay! @client
-                                                (select-keys snapshot
-                                                             [:ready :addresses :routes
-                                                              :unresolved]))
-                               (emit {:event :underlay-routes-published
-                                      :ready (:ready snapshot)
-                                      :address-count (count (:addresses snapshot))
-                                      :route-count (count routes)
-                                      :unresolved (:unresolved snapshot)})))))
-                    (.catch (fn [error]
-                              (when @client
-                                 (write-underlay! @client
-                                                 {:ready false :addresses []
-                                                  :routes (mapv (fn [route]
-                                                                  {:family (:route/family route)
-                                                                   :prefix (:route/prefix route)
-                                                                   :bits (:route/bits route)})
-                                                                routes)
-                                                  :unresolved hosts})
-                                (emit {:event :underlay-routes-error
-                                       :reason (ex-message error)}))))))))
+                (let [generation (swap! resolution-generation inc)]
+                  ;; A changed DNS answer or peer candidate invalidates the old
+                  ;; host-to-route proof until the extension acknowledges the
+                  ;; refreshed exclusions.
+                  (udp/allow-underlay-hosts!
+                   (get @(:state agent-handle) :sock) [] {})
+                  (reset! last-hosts hosts)
+                  (reset! last-routes routes)
+                  (reset! last-resolution-at now)
+                  (-> (resolve-underlay-fn hosts)
+                      (.then (fn [snapshot]
+                               (when (and @client
+                                          (= generation @resolution-generation))
+                                 (let [snapshot (assoc snapshot :routes
+                                                       (mapv (fn [route]
+                                                               {:family (:route/family route)
+                                                                :prefix (:route/prefix route)
+                                                                :bits (:route/bits route)})
+                                                             routes))]
+                                   (udp/allow-underlay-hosts!
+                                    (get @(:state agent-handle) :sock) [] {})
+                                   (reset! host-addresses (:host-addresses snapshot))
+                                   (write-underlay! @client
+                                                    (select-keys snapshot
+                                                                 [:ready :addresses :routes
+                                                                  :unresolved]))
+                                   (emit {:event :underlay-routes-published
+                                          :ready (:ready snapshot)
+                                          :address-count (count (:addresses snapshot))
+                                          :route-count (count routes)
+                                          :unresolved (:unresolved snapshot)})))))
+                      (.catch (fn [error]
+                                (when (and @client
+                                           (= generation @resolution-generation))
+                                  (write-underlay! @client
+                                                   {:ready false :addresses []
+                                                    :routes (mapv (fn [route]
+                                                                    {:family (:route/family route)
+                                                                     :prefix (:route/prefix route)
+                                                                     :bits (:route/bits route)})
+                                                                  routes)
+                                                    :unresolved hosts})
+                                  (emit {:event :underlay-routes-error
+                                         :reason (ex-message error)})))))))))
         _ (reset! refresh-ref refresh-underlay)
         refresh-timer (js/setInterval #(refresh-underlay false) 1000)
         server

@@ -1,6 +1,26 @@
 (ns kekkai.node.packet-bridge-test
-  (:require [cljs.test :refer-macros [deftest is testing]]
-            [kekkai.node.packet-bridge :as bridge]))
+  (:require [cljs.test :refer-macros [deftest is testing async]]
+            [kekkai.node.packet-bridge :as bridge]
+            ["node:fs" :as fs]
+            ["node:net" :as net]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+(defn- deferred []
+  (let [resolve-ref (atom nil)
+        promise (js/Promise. (fn [resolve _] (reset! resolve-ref resolve)))]
+    {:promise promise :resolve #(when-let [resolve @resolve-ref] (resolve %))}))
+
+(defn- wait-until [predicate timeout-ms]
+  (js/Promise.
+   (fn [resolve _]
+     (let [deadline (+ (.getTime (js/Date.)) timeout-ms)]
+       (letfn [(poll []
+                 (cond
+                   (predicate) (resolve true)
+                   (>= (.getTime (js/Date.)) deadline) (resolve false)
+                   :else (js/setTimeout poll 5)))]
+         (poll))))))
 
 (deftest os-tunnel-underlay-includes-control-plane-and-ssh-mirror-hosts
   (testing "control and discovery endpoints stay on the physical underlay"
@@ -23,3 +43,99 @@
           {:config {:heartbeat {:url "https://[fd00::1]:17892/heartbeat"}}
            :relay-pool []
            :peers {}}))))
+
+(deftest underlay-refresh-discards-an-older-dns-completion
+  (async done
+    (let [root (.mkdtempSync fs (path/join (.tmpdir os) "kekkai-underlay-generation-"))
+          socket-path (path/join root "packet.sock")
+          pending [(deferred) (deferred)]
+          calls (atom 0)
+          snapshots (atom [])
+          input-buffer (atom (.alloc js/Buffer 0))
+          client-ref (atom nil)
+          refresh-ref (atom (fn [_] nil))
+          events (atom [])
+          agent-handle {:state
+                        (atom {:config {:packet-bridge {:path socket-path}
+                                        :underlay-exclusions ["relay.example.test"]}
+                               :netmap {:netmap/self {:node/id "node-a"}
+                                        :netmap/peers []
+                                        :netmap/edges []}
+                               :relay-pool [] :peers {} :sock #js {}})}
+          component (atom nil)
+          test-client (atom nil)
+          finish (fn []
+                   (when-let [connection @test-client] (.destroy connection))
+                   (when-let [handle @component] ((:stop handle)))
+                   (.rmSync fs root #js {:recursive true :force true})
+                   (done))
+          resolve-underlay-fn (fn [_hosts]
+                                (let [index (swap! calls inc)]
+                                  (:promise (nth pending (dec index)))))
+          handle (bridge/attach agent-handle
+                                {:packet-bridge {:path socket-path}}
+                                client-ref
+                                #(swap! events conj %)
+                                refresh-ref
+                                resolve-underlay-fn)]
+      (reset! component handle)
+      (.once (:packet-server handle) "listening"
+             (fn []
+               (let [connection (net/createConnection socket-path)]
+                 (reset! test-client connection)
+                 (.on connection "connect"
+                      (fn []
+                        (let [body (.from js/Buffer "KKB1\u0003" "utf8")
+                              length (.alloc js/Buffer 4)]
+                          (.writeUInt32BE length (.-length body) 0)
+                          (.write connection
+                                  (.concat js/Buffer #js [length body])))))
+                 (.on connection "data"
+                      (fn [chunk]
+                         (swap! input-buffer
+                                (fn [current]
+                                  (.concat js/Buffer #js [current chunk])))
+                        (loop []
+                          (let [buffer @input-buffer]
+                            (when (>= (.-length buffer) 4)
+                              (let [frame-length (.readUInt32BE buffer 0)
+                                    frame-end (+ 4 frame-length)]
+                                (when (>= (.-length buffer) frame-end)
+                                  (let [body (.subarray buffer 4 frame-end)]
+                                    (when (= "KKB1\u0001"
+                                             (.toString (.subarray body 0 5) "utf8"))
+                                      (swap! snapshots conj
+                                             (js->clj
+                                              (.parse js/JSON
+                                                      (.toString (.subarray body 5) "utf8"))
+                                              :keywordize-keys true)))
+                                    (reset! input-buffer (.subarray buffer frame-end))
+                                    (recur))))))))))
+      (-> (wait-until #(= 1 @calls) 500)
+          (.then (fn [started?]
+                   (is started? "the initial route resolution started")
+                   (@refresh-ref true)
+                   (wait-until #(= 2 @calls) 500)))
+          (.then (fn [started?]
+                   (is started? "the newer route resolution started")
+                   ((:resolve (second pending))
+                    {:ready true :addresses ["198.51.100.2"]
+                     :host-addresses {"relay.example.test" ["198.51.100.2"]}
+                     :unresolved []})
+                   (wait-until #(= 1 (count @snapshots)) 500)))
+          (.then (fn [published?]
+                   (is published? "the newest DNS snapshot was published")
+                   ((:resolve (first pending))
+                    {:ready true :addresses ["198.51.100.1"]
+                     :host-addresses {"relay.example.test" ["198.51.100.1"]}
+                     :unresolved []})
+                   (js/setTimeout
+                    (fn []
+                      (is (= 1 (count @snapshots))
+                          "the late result from the older refresh was discarded")
+                      (is (= ["198.51.100.2"] (:addresses (first @snapshots))))
+                      (finish))
+                    30)))
+          (.catch (fn [error]
+                    (is false (str "underlay race test failed: " error))
+                    (finish)))))))))

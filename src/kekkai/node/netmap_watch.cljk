@@ -4,8 +4,10 @@
   (:require [cljs.reader :as edn]
             [clojure.string :as string]
             [ipns.core :as ipns]
+            [kekkai.node.netmap :as netmap]
             [kekkai.node.heartbeat :as node-heartbeat]
             [kekkai.node.signed-netmap :as signed-netmap]
+            [kotoba.bytes :as bytes]
             ["node:crypto" :as crypto]
             ["node:fs" :as fs]
             ["node:path" :as path]
@@ -15,6 +17,7 @@
 (def schema "kekkai.desired-state/v1")
 (def kind :kekkai/netmap)
 (def max-read-bytes (* 16 1024 1024))
+(def ssh-read-timeout-ms 12000)
 (def raw-cid-pattern #"b[a-z2-7]{58}")
 
 (defn- buffer [value encoding]
@@ -120,20 +123,59 @@
       {:host host :path (string/replace remote-path #"/+$" "")})))
 
 (defn- remote-read [host command]
-  (.toString (.execFileSync child-process "ssh" #js [host command]
-                            #js {:encoding "buffer" :maxBuffer max-read-bytes})
-             "utf8"))
+  (js/Promise.
+   (fn [resolve reject]
+     (.execFile child-process "ssh"
+                #js ["-o" "BatchMode=yes"
+                     "-o" "ConnectTimeout=5"
+                     "-o" "ServerAliveInterval=2"
+                     "-o" "ServerAliveCountMax=2"
+                     host command]
+                #js {:encoding "buffer"
+                     :maxBuffer max-read-bytes
+                     :timeout ssh-read-timeout-ms
+                     :killSignal "SIGTERM"}
+                (fn [error stdout _stderr]
+                  (if error
+                    (reject (ex-info "SSH desired-state read failed"
+                                     {:type :kekkai/ssh-mirror-read-failed
+                                      :host host}))
+                    (resolve (.toString stdout "utf8"))))))))
+
+(defn- promise-like? [value]
+  (and (some? value) (fn? (.-then value))))
+
+(defn- map-value [value f]
+  (if (promise-like? value)
+    (.then value f)
+    (f value)))
+
+(defn- all-values [values f]
+  (if (some promise-like? values)
+    (-> (js/Promise.all (clj->js (mapv #(js/Promise.resolve %) values)))
+        (.then (fn [resolved] (f (vec (array-seq resolved))))))
+    (f values)))
 
 (defn- read-root [root relative]
   (if-let [{:keys [host path]} (remote-root root)]
     (let [target (str path "/" relative)
-          text (remote-read host
-                            (str "if test -f " target "; then cat " target
-                                 "; else printf '" missing-marker "'; fi"))]
-      (when-not (= missing-marker text) text))
+          result (remote-read host
+                              (str "if test -f " target "; then cat " target
+                                   "; else printf '" missing-marker "'; fi"))]
+      (-> result
+          (.then #(when-not (= missing-marker %) %))
+          ;; An unavailable mirror should not block another independent root.
+          (.catch (fn [_] nil))))
     (let [target (path/join root relative)]
       (when (.existsSync fs target)
         (.readFileSync fs target "utf8")))))
+
+(defn- first-readable [roots relative]
+  (if-let [root (first roots)]
+    (map-value (read-root root relative)
+               (fn [text]
+                 (if text text (first-readable (rest roots) relative))))
+    nil))
 
 (defn- subject-key [subject]
   (cidv1-raw (buffer subject "utf8")))
@@ -148,46 +190,52 @@
   (str "blocks/" cid ".edn"))
 
 (defn- current-publication [roots subject authority]
-  (let [heads (mapv (fn [root]
-                      {:root root
-                       :head (some-> (read-root root (head-path subject))
-                                     edn/read-string)})
-                    roots)
-        available (filterv :head heads)]
-    (when (seq available)
-      (doseq [{:keys [head]} available]
-        (when-not (and (map? head)
-                       (integer? (:desired/epoch head))
-                       (pos? (:desired/epoch head))
-                       (string? (:desired/cid head))
-                       (= subject (:desired/subject head))
-                       (= (:graph authority) (:desired/name head)))
-          (throw (ex-info "desired-state mirror head is malformed"
-                          {:type :kekkai/invalid-desired-head}))))
-      (let [epoch (apply max (map #(get-in % [:head :desired/epoch]) available))
-            latest (filterv #(= epoch (get-in % [:head :desired/epoch])) available)
-            cids (set (map #(get-in % [:head :desired/cid]) latest))]
-        (when-not (= 1 (count cids))
-          (throw (ex-info "desired-state mirrors disagree at the same epoch"
-                          {:type :kekkai/desired-split-brain :epoch epoch :cids cids})))
-        (let [cid (first cids)
-              envelope (some (fn [{:keys [root]}]
-                               (some-> (read-root root (block-path cid))
-                                       edn/read-string))
-                             latest)]
-          (when-not envelope
-            (throw (ex-info "desired-state head has no readable block"
-                            {:type :kekkai/desired-block-unavailable :cid cid})))
-          (let [statement (verify-desired-envelope envelope authority subject)]
-            (when-not (and (= cid (:desired/cid statement))
-                           (= epoch (:desired/epoch statement)))
-              (throw (ex-info "desired-state head does not match its signed block"
-                              {:type :kekkai/desired-head-block-mismatch})))
-            (let [node-envelope (:desired/payload statement)
-                  node-map (signed-netmap/verify-envelope
-                            (pr-str node-envelope)
-                            (:authority-spki-b64 authority))]
-              (assoc statement :node-envelope node-envelope :netmap node-map))))))))
+  (all-values
+   (mapv #(read-root % (head-path subject)) roots)
+   (fn [head-texts]
+     (let [heads (mapv (fn [root text]
+                         {:root root
+                          :head (when text (edn/read-string text))})
+                       roots head-texts)
+           available (filterv :head heads)]
+       (when (seq available)
+         (doseq [{:keys [head]} available]
+           (when-not (and (map? head)
+                          (integer? (:desired/epoch head))
+                          (pos? (:desired/epoch head))
+                          (string? (:desired/cid head))
+                          (= subject (:desired/subject head))
+                          (= (:graph authority) (:desired/name head)))
+             (throw (ex-info "desired-state mirror head is malformed"
+                             {:type :kekkai/invalid-desired-head}))))
+         (let [epoch (apply max (map #(get-in % [:head :desired/epoch]) available))
+               latest (filterv #(= epoch (get-in % [:head :desired/epoch])) available)
+               cids (set (map #(get-in % [:head :desired/cid]) latest))]
+           (when-not (= 1 (count cids))
+             (throw (ex-info "desired-state mirrors disagree at the same epoch"
+                             {:type :kekkai/desired-split-brain
+                              :epoch epoch :cids cids})))
+           (let [cid (first cids)
+                 block-text (first-readable (mapv :root latest) (block-path cid))]
+             (map-value
+              block-text
+              (fn [text]
+                (when-not text
+                  (throw (ex-info "desired-state head has no readable block"
+                                  {:type :kekkai/desired-block-unavailable
+                                   :cid cid})))
+                (let [envelope (edn/read-string text)
+                      statement (verify-desired-envelope envelope authority subject)]
+                  (when-not (and (= cid (:desired/cid statement))
+                                 (= epoch (:desired/epoch statement)))
+                    (throw (ex-info "desired-state head does not match its signed block"
+                                    {:type :kekkai/desired-head-block-mismatch})))
+                  (let [node-envelope (:desired/payload statement)
+                        node-map (signed-netmap/verify-envelope
+                                  (pr-str node-envelope)
+                                  (:authority-spki-b64 authority))]
+                    (assoc statement :node-envelope node-envelope
+                                     :netmap node-map))))))))))))
 
 (defn pull-netmap
   "Read and authenticate the latest signed netmap for one desired-state subject."
@@ -328,7 +376,26 @@
         (try (.unlinkSync fs temp) (catch :default _ nil))
         (throw error)))))
 
-(defn- install-newer! [output authority node-envelope node-map]
+(defn- validate-replacement! [config node-map]
+  (let [problems (netmap/validate node-map)
+        self (:netmap/self node-map)
+        expected-key (some-> (:node-static-key config) bytes/unhex bytes/hex)]
+    (when (seq problems)
+      (throw (ex-info "replacement netmap is not usable"
+                      {:type :kekkai/invalid-replacement-netmap
+                       :problems problems})))
+    (when-not (= (:node-id config) (:node/id self))
+      (throw (ex-info "replacement netmap changes local node ID"
+                      {:type :kekkai/netmap-self-mismatch
+                       :expected (:node-id config)
+                       :received (:node/id self)})))
+    (when-not (= expected-key (:node/key self))
+      (throw (ex-info "replacement netmap changes local node key"
+                      {:type :kekkai/netmap-self-key-mismatch})))
+    node-map))
+
+(defn- install-newer! [output authority config node-envelope node-map]
+  (validate-replacement! config node-map)
   (regular-output! output)
   (let [current-envelope (when (.existsSync fs output)
                            (edn/read-string (.readFileSync fs output "utf8")))
@@ -356,11 +423,12 @@
                       {:type :kekkai/netmap-version-rollback
                        :installed current-version :received new-version})))))
 
-(defn- install-publication! [{:keys [subject authority-spki-b64 output-file]}
+(defn- install-publication! [{:keys [subject authority-spki-b64 output-file]
+                              :as config}
                             publication]
   (if-not publication
     {:status :unavailable :subject subject}
-    (let [updated? (install-newer! output-file authority-spki-b64
+    (let [updated? (install-newer! output-file authority-spki-b64 config
                                    (:node-envelope publication)
                                    (:netmap publication))]
       {:status (if updated? :installed :unchanged)
@@ -376,17 +444,20 @@
     (if api-url
       (.then (pull-netmap-https! config subject authority (or fetch-fn js/fetch))
              #(install-publication! config %))
-      (install-publication! config
-                            (pull-netmap roots subject authority-spki-b64)))))
+      (map-value (pull-netmap roots subject authority-spki-b64)
+                 #(install-publication! config %)))))
 
 (defn validate-config! [config]
-  (let [https-config? (and (string? (:api-url config))
-                           (string? (:node-id config))
+  (let [identity-config? (and (string? (:node-id config))
+                              (string? (:node-static-key config)))
+        https-config? (and (string? (:api-url config))
+                           identity-config?
                            (map? (:heartbeat config))
                            (string? (get-in config [:heartbeat :did]))
                            (string? (get-in config [:heartbeat :seed-file])))
         mirror-config? (and (vector? (:roots config)) (seq (:roots config)))]
-    (when-not (and (map? config) (or https-config? mirror-config?)
+    (when-not (and (map? config) identity-config?
+                   (or https-config? mirror-config?)
                    (string? (:subject config))
                    (string? (:authority-spki-b64 config))
                    (string? (:output-file config)))

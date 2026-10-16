@@ -2,6 +2,46 @@
   (:require [kotoba.test :refer [deftest is async]]
             [kekkai.node.udp :as udp]))
 
+(defn- fake-bind-socket [type]
+  (let [sock #js {}
+        handlers (atom {})]
+    (aset sock "type" type)
+    (aset sock "on" (fn [event callback]
+                       (swap! handlers assoc event callback)
+                       sock))
+    (aset sock "removeAllListeners" (fn [] (reset! handlers {}) sock))
+    (aset sock "close" (fn [] nil))
+    (aset sock "bind"
+          (fn [_port _host callback]
+            (if (= type "udp6")
+              (let [error (js/Error. "IPv6 unavailable")]
+                (set! (.-code error) "EAFNOSUPPORT")
+                (js/setTimeout #((get @handlers "error") error) 0))
+              (js/setTimeout callback 0))))
+    sock))
+
+(deftest socket-falls-back-to-udp4-if-dual-stack-bind-is-unavailable
+  (async done
+    (let [created (atom [])
+          errors (atom [])
+          socket-api #js {:createSocket
+                          (fn [options]
+                            (let [type (.-type options)]
+                              (swap! created conj type)
+                              (fake-bind-socket type)))}]
+      (-> (udp/socket {:socket-api socket-api
+                       :on-error #(swap! errors conj %)
+                       :port 0})
+          (.then (fn [sock]
+                   (is (= ["udp6" "udp4"] @created))
+                   (is (= "udp4" (.-type sock)))
+                   (is (empty? @errors)
+                       "the handled IPv6 bind failure is not surfaced")
+                   (done)))
+          (.catch (fn [error]
+                    (is false (str "IPv4 fallback failed: " error))
+                    (done)))))))
+
 (deftest outgoing-datagrams-wait-for-acknowledged-underlay-routes
   (let [sent (atom [])
         socket #js {:send (fn [_bytes port host]
@@ -41,6 +81,30 @@
     (is (= [{:port 3478 :host "2001:db8::7"}] @sent)
         "the queued IPv6 probe is released only to the acknowledged IPv6 route")
     (udp/clear-underlay-guard! socket)))
+
+(deftest family-specific-send-rechecks-guard-after-dns-resolution
+  (async done
+    (let [sent (atom [])
+          socket #js {:send (fn [_bytes port host callback]
+                              (swap! sent conj {:port port :host host})
+                              (when callback (callback nil)))}]
+      ;; The async DNS lookup starts without a guard. Install it before the
+      ;; lookup callback returns, which is the race the packet tunnel can hit.
+      (udp/send-family! socket [3 2 1] "localhost:3478" 6)
+      (udp/guard-underlay! socket)
+      (js/setTimeout
+       (fn []
+         (is (empty? @sent) "DNS completion remains queued until route ACK")
+         (udp/allow-underlay-hosts!
+          socket ["localhost"] {"localhost" ["::1"]})
+         (js/setTimeout
+          (fn []
+            (udp/clear-underlay-guard! socket)
+            (is (= [{:port 3478 :host "::1"}] @sent)
+                "the packet is sent only to the acknowledged IPv6 address")
+            (done))
+          20))
+       20))))
 
 (deftest dual-stack-socket-roundtrips-ipv4-and-ipv6-loopback
   (async done
