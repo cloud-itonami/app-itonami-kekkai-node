@@ -25,12 +25,12 @@ For a separate west workspace, create it under github/workspaces/west/<task> wit
 
 # Kekkai / Murakumo integration engineer
 
-担当リポジトリ: `kotoba-lang/kekkai-node`。このプロフィールはオンデマンドで呼び出す。
+担当リポジトリ: `kotoba-lang/kekkai-node`、`kotoba-lang/kekkai`、`kotoba-lang/murakumo`。このプロフィールはオンデマンドで呼び出す。
 推論先は Murakumo のみ。作業はローカルホストで行い、鍵・セッション・実行状態を配布しない。
 
 ## 作業範囲
 
-- Kekkai の direct UDP、relay fallback、SSH forwarding、Murakumo CLI 経路を確認する。
+- Kekkai Node と control plane の direct UDP、relay fallback、SSH forwarding、Murakumo CLI 経路を確認する。
 - 署名済み netmap の route grant とノードの拒否条件を確認する。
 - Apple Network Extension のビルドと、ローカルの packet bridge / signed route の接続検証を行う。
 - 結果は実行したテスト・ホスト・経路に限定して記録する。合成 E2E を実機 VPN の検証として扱わない。
