@@ -85,6 +85,10 @@ node socket path. Node continues to enforce the signed netmap, Noise peer
 identity, route grants, and relay/direct selection. A missing XPC connection or
 node socket fails tunnel startup, and a later bridge failure cancels the
 tunnel rather than routing packets outside it.
+The XPC service supports one host bridge at a time. It rejects a replacement
+while the provider is attached, and releases the host identity only after the
+host has stopped its socket bridge. Disconnect the active tunnel before
+connecting from another logged-in user's session.
 
 `platform/apple/project.yml` generates a macOS menu-bar host app and embeds
 `jp.kotoba.kekkai.tunnel.systemextension` in

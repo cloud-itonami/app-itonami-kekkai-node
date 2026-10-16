@@ -137,6 +137,10 @@ public final class KekkaiLocalNodeTransport: KekkaiPacketTransport {
     }
 
     public func stop() {
+        stop(completion: {})
+    }
+
+    public func stop(completion: @escaping () -> Void) {
         queue.async {
             self.stopped = true
             self.setReady(false)
@@ -151,6 +155,7 @@ public final class KekkaiLocalNodeTransport: KekkaiPacketTransport {
             self.connection = nil
             connection?.stateUpdateHandler = nil
             connection?.cancel()
+            completion()
         }
     }
 

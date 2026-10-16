@@ -264,8 +264,9 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
     }
 
     func stopPacketBridge(withReply reply: @escaping (NSError?) -> Void) {
-        stopNodeTransport()
-        reply(nil)
+        stopNodeTransport {
+            reply(nil)
+        }
     }
 
     private func extensionProxy() -> KekkaiTunnelExtensionProtocol? {
@@ -286,12 +287,16 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
         } as? KekkaiTunnelExtensionProtocol
     }
 
-    private func stopNodeTransport() {
+    private func stopNodeTransport(completion: @escaping () -> Void = {}) {
         bridgeLock.lock()
         let transport = nodeTransport
         nodeTransport = nil
         bridgeLock.unlock()
-        transport?.stop()
+        guard let transport else {
+            completion()
+            return
+        }
+        transport.stop(completion: completion)
     }
 
     private func activateSystemExtension(completion: @escaping (Error?) -> Void) {
