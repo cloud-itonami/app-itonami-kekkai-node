@@ -70,30 +70,45 @@ IPv4 and IPv6, resolves relay and STUN hostnames to both address families, and
 rechecks the route guard after asynchronous DNS before sending. STUN IPv6
 mappings and relay literals use the `[address]:port` candidate format. The provider sets an MTU of at least
 1280, validates IPv4 total length and IPv6
-payload length, and drops unless an installed direct transport or the default
-local-node bridge is ready. The default transport is
-`KekkaiLocalNodeTransport`: it uses a
-Network.framework UNIX-domain connection to the local Kekkai-node packet
-bridge, with the same four-byte big-endian length framing as the Linux bridge.
-The tunnel provider configuration key `packetBridgePath` must match the node's
-`:packet-bridge :path`; the menu-bar host defaults to the
-`group.jp.kotoba.kekkai` app-group container and lets the operator set the
-matching node socket path. Node continues to enforce the signed netmap, Noise
-peer identity, route grants, and relay/direct selection. A missing bridge fails
-tunnel startup, and a later bridge failure cancels the tunnel rather than
-routing packets outside it.
+payload length, and drops unless the authenticated bridge is ready. The
+menu-bar host runs `KekkaiLocalNodeTransport` in the logged-in user's context
+and opens the Kekkai-node UNIX socket in that user's app-group container. The
+global system extension never opens that per-user path. Instead,
+`KekkaiXPCTransport` and the host relay bounded packet and underlay frames over
+the app-group-scoped privileged XPC service named by
+`NetworkExtension.NEMachServiceName`; both ends require the expected host or
+system-extension bundle identifier signed by the same Team ID. The tunnel
+provider configuration key `packetBridgePath` must match the node's
+`:packet-bridge :path`; the host app
+defaults to `group.jp.kotoba.kekkai` and lets the operator set the matching
+node socket path. Node continues to enforce the signed netmap, Noise peer
+identity, route grants, and relay/direct selection. A missing XPC connection or
+node socket fails tunnel startup, and a later bridge failure cancels the
+tunnel rather than routing packets outside it.
+The XPC service supports one host bridge at a time. It rejects a replacement
+while the provider is attached, and releases the host identity only after the
+host has stopped its socket bridge. Disconnect the active tunnel before
+connecting from another logged-in user's session.
+When quitting the menu-bar host with a tunnel active, it waits for VPN teardown
+and underlay release before closing the bridge and XPC connection.
 
-`platform/apple/project.yml` generates a macOS menu-bar host app and embeds the
-Packet Tunnel app extension. The host can save/load the VPN profile, connect or
-disconnect, and configure the shared socket path. Both targets carry the
-`group.jp.kotoba.kekkai` app-group entitlement; the extension also carries the
-Packet Tunnel and outbound-network entitlements. Set the Kekkai node's
-`:packet-bridge :path` to the same socket path shown in the host app. The app
-group must be registered for the App ID and included in the signing profile.
-The Kekkai-node process that creates the socket must also be authorized to use
-that group container; the extension's entitlement does not grant access to a
-separate CLI process. Package the node launcher as a signed group member, or
-verify the supported macOS user-authorization path for the exact launcher.
+`platform/apple/project.yml` generates a macOS menu-bar host app and embeds
+`jp.kotoba.kekkai.tunnel.systemextension` in
+`Contents/Library/SystemExtensions`. The system-extension form supports direct
+macOS distribution; the Packet Tunnel app-extension form is App Store only.
+The host requests system-extension activation when the operator clicks
+Connect, then saves/loads the VPN profile and configures the shared socket
+path. macOS may require an administrator to approve the extension in System
+Settings. The host and extension must use the same Team ID and matching
+provisioning profiles. The host needs the System Extension install entitlement
+and `NSSystemExtensionUsageDescription`; the Developer ID Release configuration
+uses `packet-tunnel-provider-systemextension` on both targets. The Debug
+configuration uses the standard `packet-tunnel-provider` entitlement for Apple
+Development signing. Both targets carry the `group.jp.kotoba.kekkai` app-group
+entitlement, which also prefixes the XPC service name. Set the Kekkai node's
+`:packet-bridge :path` to the same user-context socket path shown in the host
+app. The node process and host app run as the same user; the privileged XPC
+bridge carries frames into the system extension.
 
 Build an arm64 app and extension without a Developer ID signature or provisioning profile with:
 
@@ -109,16 +124,21 @@ xcodebuild -project KekkaiTunnel.xcodeproj -scheme KekkaiTunnelHost \
 ```
 
 The extension target's build phase compiles and links the macOS Kotoba packet
-plane. This build proves the app and extension compile together; it does not
-prove the signed extension can access the daemon socket or run as an active VPN
-provider.
+plane. This build proves the host app, system extension, and XPC bridge compile
+and embed together; it does not prove signed activation, the XPC handshake, or
+the live packet path. For a Developer ID Release build, provide the team ID and
+the two profile names using `KEKKAI_DEVELOPER_TEAM_ID`,
+`KEKKAI_HOST_DEVELOPER_ID_PROFILE`, and
+`KEKKAI_EXTENSION_DEVELOPER_ID_PROFILE`. A system extension must be signed
+with those matching Developer ID profiles, installed with the host app under
+`/Applications`, and receive the required macOS approval before runtime
+testing.
 
-This local bridge is a host IPC boundary, not the overlay transport itself. The
-macOS Network Extension sandbox, socket ownership/permissions, signed extension
-target, node-process access to the app-group container, and provisioning profile
-must be verified in the packaged app before claiming an operative system
-tunnel. An ordinary Swift process can typecheck and exercise the framed socket,
-but that does not prove the extension can open the installed daemon's socket.
+This XPC bridge is a host IPC boundary, not the overlay transport itself. The
+signed Network Extension sandbox, XPC service entitlement, socket ownership,
+provisioning profiles, and full packet flow must be verified in the installed
+app before claiming an operative system tunnel. An unsigned build does not
+prove the extension can communicate with the host or route live packets.
 
 The provider currently learns exclusions through the local node's authenticated
 netmap and authenticated peer discovery state. The local socket protocol gates

@@ -8,7 +8,7 @@ settings:
     MACOSX_DEPLOYMENT_TARGET: "13.0"
     SWIFT_VERSION: "5.0"
     CODE_SIGN_STYLE: Automatic
-    CURRENT_PROJECT_VERSION: "1"
+    CURRENT_PROJECT_VERSION: "3"
     MARKETING_VERSION: "0.1.0"
 targets:
   KekkaiTunnelHost:
@@ -16,34 +16,51 @@ targets:
     platform: macOS
     sources:
       - path: KekkaiTunnelHost
+      - path: Sources/KekkaiTunnel/KekkaiTransport.swift
+      - path: Sources/KekkaiTunnel/KekkaiLocalNodeTransport.swift
+      - path: Sources/KekkaiTunnel/KekkaiTunnelXPCProtocol.swift
     dependencies:
       - target: KekkaiTunnelExtension
         embed: true
+      - sdk: SystemExtensions.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: jp.kotoba.kekkai
         PRODUCT_NAME: KekkaiTunnel
         INFOPLIST_KEY_CFBundleDisplayName: Kekkai
         INFOPLIST_KEY_LSUIElement: YES
+        INFOPLIST_KEY_NSSystemExtensionUsageDescription: Kekkai installs a system packet-tunnel extension to route authorized Kekkai peer traffic.
+        INFOPLIST_KEY_KekkaiMachServiceName: group.jp.kotoba.kekkai.service
+        INFOPLIST_KEY_KekkaiSigningTeamID: $(DEVELOPMENT_TEAM)
         GENERATE_INFOPLIST_FILE: YES
         ENABLE_HARDENED_RUNTIME: YES
         ENABLE_APP_SANDBOX: YES
-        CODE_SIGN_ENTITLEMENTS: KekkaiTunnelHost/KekkaiTunnelHost.entitlements
+      configs:
+        Debug:
+          CODE_SIGN_STYLE: Automatic
+          CODE_SIGN_ENTITLEMENTS: KekkaiTunnelHost/KekkaiTunnelHost.debug.entitlements
+        Release:
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Developer ID Application
+          DEVELOPMENT_TEAM: $(KEKKAI_DEVELOPER_TEAM_ID)
+          PROVISIONING_PROFILE_SPECIFIER: $(KEKKAI_HOST_DEVELOPER_ID_PROFILE)
+          CODE_SIGN_ENTITLEMENTS: KekkaiTunnelHost/KekkaiTunnelHost.entitlements
   KekkaiTunnelExtension:
-    type: app-extension
+    type: system-extension
     platform: macOS
     sources:
       - path: Sources/KekkaiTunnel
+        excludes:
+          - KekkaiLocalNodeTransport.swift
     dependencies:
       - sdk: Network.framework
       - sdk: NetworkExtension.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: jp.kotoba.kekkai.tunnel
-        PRODUCT_NAME: KekkaiTunnelExtension
+        PRODUCT_NAME: $(PRODUCT_BUNDLE_IDENTIFIER)
         INFOPLIST_FILE: KekkaiTunnelExtension/Info.plist
         GENERATE_INFOPLIST_FILE: YES
-        CODE_SIGN_ENTITLEMENTS: KekkaiTunnel.entitlements
         SKIP_INSTALL: YES
         ENABLE_APP_SANDBOX: YES
         ENABLE_HARDENED_RUNTIME: YES
@@ -52,6 +69,16 @@ targets:
         OTHER_LDFLAGS:
           - $(inherited)
           - -lKekkaiPacketPlane
+      configs:
+        Debug:
+          CODE_SIGN_STYLE: Automatic
+          CODE_SIGN_ENTITLEMENTS: KekkaiTunnel.debug.entitlements
+        Release:
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Developer ID Application
+          DEVELOPMENT_TEAM: $(KEKKAI_DEVELOPER_TEAM_ID)
+          PROVISIONING_PROFILE_SPECIFIER: $(KEKKAI_EXTENSION_DEVELOPER_ID_PROFILE)
+          CODE_SIGN_ENTITLEMENTS: KekkaiTunnel.entitlements
     preBuildScripts:
       - name: Build Kotoba packet plane
         script: |

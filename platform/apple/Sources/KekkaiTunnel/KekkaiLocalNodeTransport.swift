@@ -2,10 +2,11 @@ import Darwin
 import Foundation
 import Network
 
-/// PacketTunnelProvider adapter for the local framed socket served by
-/// `kekkai.node.packet-bridge`. The Node process owns signed-netmap checks,
-/// Noise sessions, direct/relay selection, and revocation; this class only
-/// moves bounded raw-IP frames between NetworkExtension and that agent.
+/// User-context host adapter for the local framed socket served by
+/// `kekkai.node.packet-bridge`. The menu-bar app owns this connection and
+/// relays bounded frames to the global system extension over XPC. The Node
+/// process owns signed-netmap checks, Noise sessions, route selection, and
+/// revocation.
 public final class KekkaiLocalNodeTransport: KekkaiPacketTransport {
     private enum BridgeError: LocalizedError {
         case missingSocketPath
@@ -136,6 +137,10 @@ public final class KekkaiLocalNodeTransport: KekkaiPacketTransport {
     }
 
     public func stop() {
+        stop(completion: {})
+    }
+
+    public func stop(completion: @escaping () -> Void) {
         queue.async {
             self.stopped = true
             self.setReady(false)
@@ -148,8 +153,20 @@ public final class KekkaiLocalNodeTransport: KekkaiPacketTransport {
             self.input.removeAll(keepingCapacity: false)
             let connection = self.connection
             self.connection = nil
-            connection?.stateUpdateHandler = nil
-            connection?.cancel()
+            guard let connection else {
+                completion()
+                return
+            }
+            if case .cancelled = connection.state {
+                completion()
+                return
+            }
+            connection.stateUpdateHandler = { [weak connection] state in
+                guard case .cancelled = state else { return }
+                connection?.stateUpdateHandler = nil
+                completion()
+            }
+            connection.cancel()
         }
     }
 
