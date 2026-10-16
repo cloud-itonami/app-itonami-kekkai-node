@@ -34,6 +34,7 @@ mkdir -p "$output_dir"
 "$compiler_bin" -M check "$source_file" \
   --policy "$repo_dir/kotoba/policy.edn"
 "$compiler_bin" -M compile "$source_file" --target aarch64-macos \
+  --fuel 512 \
   --policy "$repo_dir/kotoba/policy.edn" \
   --output "$output_dir/packet-plane-macos.kexe"
 "$compiler_bin" -M package-macos \
@@ -42,12 +43,12 @@ mkdir -p "$output_dir"
   --manifest-output "$output_dir/packet-plane-macos.edn"
 
 xcrun --sdk macosx clang -arch arm64 -I "$runtime_dir" \
-  '-DKOTOBA_IOS_TARGET="aarch64-macos-kotoba-v1"' \
+  '-DKOTOBA_IOS_TARGET="aarch64-macos-static-kotoba-v1"' \
   -c "$runtime_dir/kotoba_ios_host.c" \
   -o "$output_dir/kotoba_ios_host.o"
 xcrun --sdk macosx clang -arch arm64 -I "$runtime_dir" \
   -I "$repo_dir/platform/apple/Native" \
-  '-DKEKKAI_KOTOBA_TARGET_PROFILE="aarch64-macos-kotoba-v1"' \
+  '-DKEKKAI_KOTOBA_TARGET_PROFILE="aarch64-macos-static-kotoba-v1"' \
   -c "$repo_dir/platform/apple/Native/KotobaPacketPlaneBridge.c" \
   -o "$output_dir/KotobaPacketPlaneBridge.o"
 
