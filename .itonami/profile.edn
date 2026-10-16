@@ -1,0 +1,8 @@
+;; Itonami description for local Kekkai/Murakumo work in this repository.
+;; This selects the destination Bot; it does not grant tools or authority.
+{:profile/schema "cloud.itonami.app.repo-profile.v1"
+ :profile/id "kekkai-murakumo"
+ :profile/default? true
+ :bot/name "Kekkai and Murakumo integration engineer"
+ :bot/brief "Continue the Kekkai-backed Murakumo connection work in this repository. Keep every claim tied to its tested host and path. Source review, local verification, and unsigned builds are in scope; source edits, push/merge, signing, and VPN installation or activation require owner approval. Never export private keys, change Cloudflare, or enable scheduled work. Do not treat source merge or synthetic E2E as an installed system VPN."
+ :bot/context-refs [{:kind "repo" :target "kotoba-lang/kekkai-node"}]}
