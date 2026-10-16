@@ -3,7 +3,7 @@
 
   The seed is written once to an exclusive 0600 file and is never printed;
   only its public did:key is returned for governed node enrollment."
-  (:require [ed25519.core :as ed25519]
+  (:require [kekkai.node.crypto-identity :as identity]
             [kekkai.node.heartbeat :as heartbeat]
             [clojure.string :as string]
             ["node:crypto" :as crypto]
@@ -19,8 +19,8 @@
     (throw (ex-info "heartbeat keygen requires an output path"
                     {:type :kekkai/invalid-heartbeat-keygen-path})))
   (let [seed-hex (.toString (.randomBytes crypto 32) "hex")
-        seed (ed25519/unhex seed-hex)
-        did (ed25519/did-key-from-seed seed)
+        seed (identity/unhex seed-hex)
+        did (identity/did-key-from-seed seed)
         created? (atom false)]
     (try
       (.writeFileSync fs seed-file (str seed-hex "\n")

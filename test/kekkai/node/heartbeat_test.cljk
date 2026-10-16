@@ -1,6 +1,6 @@
 (ns kekkai.node.heartbeat-test
   (:require [kotoba.test :refer [deftest is async testing]]
-            [ed25519.core :as ed25519]
+            [kekkai.node.crypto-identity :as identity]
             [kekkai.node.endpoint :as endpoint]
             [kekkai.node.heartbeat :as heartbeat]
             [kekkai.node.heartbeat-keygen :as keygen]
@@ -9,7 +9,7 @@
             ["node:path" :as path]))
 
 (def ^:private seed
-  (ed25519/unhex "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"))
+  (identity/unhex "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"))
 (def ^:private did "did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd")
 (def ^:private signature
   "81d6948a7e939d772a27dd5323cbc639c55cd0f3c05932008b37eb9c46760b3373d48055cd134c665af64798ab262ef01cb37406c894bdab3e5d4c5df03df401")
@@ -17,7 +17,7 @@
 (deftest node-signature-matches-control-plane-wire-vector
   (let [value (heartbeat/sign "node-a" 1 100000
                               ["203.0.113.40:41641"] seed)]
-    (is (= did (ed25519/did-key-from-seed seed)))
+    (is (= did (identity/did-key-from-seed seed)))
     (is (= signature (:heartbeat/signature-hex value)))
     (is (= ["203.0.113.40:41641"] (:endpoints value)))))
 
@@ -56,7 +56,7 @@
         seed-file (.join path directory "node.seed")
         sequence-file (.join path directory "heartbeat.seq")]
     (try
-      (.writeFileSync fs seed-file (str (ed25519/hexify seed) "\n")
+      (.writeFileSync fs seed-file (str (identity/hexify seed) "\n")
                       #js {:encoding "utf8" :mode 384})
       (.chmodSync fs seed-file 384)
       (is (= did (:did (heartbeat/load-identity! {:seed-file seed-file :did did}))))

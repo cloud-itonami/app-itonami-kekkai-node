@@ -5,7 +5,7 @@
   plane. The Ed25519 DID seed is separate from the node's X25519 Noise key and
   stays in a mode-0600 file; only signed candidate data leaves this process."
   (:require [clojure.string :as string]
-            [ed25519.core :as ed25519]
+            [kekkai.node.crypto-identity :as identity]
             [kekkai.node.endpoint :as endpoint]
             ["node:fs" :as fs]
             ["node:crypto" :as crypto]))
@@ -33,7 +33,7 @@
       (throw (ex-info "invalid heartbeat signing input"
                       {:type :kekkai/invalid-heartbeat-signing-input})))
     (assoc message :heartbeat/signature-hex
-           (ed25519/hexify (ed25519/sign seed (payload-bytes node-id message))))))
+           (identity/hexify (identity/sign seed (payload-bytes node-id message))))))
 
 (defn sign-netmap-read
   "Sign a read-only bootstrap request with the enrolled heartbeat DID seed."
@@ -41,10 +41,10 @@
   (when-not (and (string? node-id) (seq node-id) (integer? issued-at))
     (throw (ex-info "invalid netmap-read signing input"
                     {:type :kekkai/invalid-netmap-read})))
-  (ed25519/hexify
-   (ed25519/sign seed
-                 (.encode (js/TextEncoder.)
-                          (pr-str [netmap-read-signing-domain node-id issued-at])))))
+  (identity/hexify
+   (identity/sign seed
+                  (.encode (js/TextEncoder.)
+                           (pr-str [netmap-read-signing-domain node-id issued-at])))))
 
 (defn candidate-strings
   "Return a stable, complete wire vector from local and STUN candidates.
@@ -102,8 +102,8 @@
     (when-not (re-matches #"(?i)[0-9a-f]{64}" text)
       (throw (ex-info "heartbeat seed file must contain exactly 32 raw bytes in hex"
                       {:type :kekkai/invalid-heartbeat-seed})))
-    (let [seed (ed25519/unhex text)
-          derived (ed25519/did-key-from-seed seed)]
+    (let [seed (identity/unhex text)
+          derived (identity/did-key-from-seed seed)]
       (when-not (= did derived)
         (throw (ex-info "heartbeat seed does not match the enrolled DID"
                         {:type :kekkai/heartbeat-did-mismatch})))
