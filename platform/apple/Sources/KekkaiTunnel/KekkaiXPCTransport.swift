@@ -78,8 +78,9 @@ public final class KekkaiXPCTransport: KekkaiPacketTransport {
         failureHandler = nil
         startCompletion = nil
         lock.unlock()
-        KekkaiSystemExtensionXPCService.shared.detach(self)
-        KekkaiSystemExtensionXPCService.shared.stopPacketBridge()
+        KekkaiSystemExtensionXPCService.shared.stopPacketBridge { [self] in
+            KekkaiSystemExtensionXPCService.shared.detach(self)
+        }
     }
 
     func receiveFromNode(_ packet: Data, family: Int32) {

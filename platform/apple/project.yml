@@ -8,7 +8,7 @@ settings:
     MACOSX_DEPLOYMENT_TARGET: "13.0"
     SWIFT_VERSION: "5.0"
     CODE_SIGN_STYLE: Automatic
-    CURRENT_PROJECT_VERSION: "2"
+    CURRENT_PROJECT_VERSION: "3"
     MARKETING_VERSION: "0.1.0"
 targets:
   KekkaiTunnelHost:
@@ -31,7 +31,7 @@ targets:
         INFOPLIST_KEY_LSUIElement: YES
         INFOPLIST_KEY_NSSystemExtensionUsageDescription: Kekkai installs a system packet-tunnel extension to route authorized Kekkai peer traffic.
         INFOPLIST_KEY_KekkaiMachServiceName: group.jp.kotoba.kekkai.service
-        INFOPLIST_KEY_KekkaiTeamIdentifierPrefix: $(TeamIdentifierPrefix)
+        INFOPLIST_KEY_KekkaiSigningTeamID: $(DEVELOPMENT_TEAM)
         GENERATE_INFOPLIST_FILE: YES
         ENABLE_HARDENED_RUNTIME: YES
         ENABLE_APP_SANDBOX: YES

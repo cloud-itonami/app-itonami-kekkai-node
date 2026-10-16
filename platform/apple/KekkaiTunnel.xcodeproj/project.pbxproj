@@ -323,7 +323,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -389,7 +389,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -427,7 +427,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Kekkai;
 				INFOPLIST_KEY_KekkaiMachServiceName = group.jp.kotoba.kekkai.service;
-				INFOPLIST_KEY_KekkaiTeamIdentifierPrefix = "$(TeamIdentifierPrefix)";
+				INFOPLIST_KEY_KekkaiSigningTeamID = "$(DEVELOPMENT_TEAM)";
 				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSSystemExtensionUsageDescription = "Kekkai installs a system packet-tunnel extension to route authorized Kekkai peer traffic.";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -481,7 +481,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Kekkai;
 				INFOPLIST_KEY_KekkaiMachServiceName = group.jp.kotoba.kekkai.service;
-				INFOPLIST_KEY_KekkaiTeamIdentifierPrefix = "$(TeamIdentifierPrefix)";
+				INFOPLIST_KEY_KekkaiSigningTeamID = "$(DEVELOPMENT_TEAM)";
 				INFOPLIST_KEY_LSUIElement = YES;
 				INFOPLIST_KEY_NSSystemExtensionUsageDescription = "Kekkai installs a system packet-tunnel extension to route authorized Kekkai peer traffic.";
 				LD_RUNPATH_SEARCH_PATHS = (

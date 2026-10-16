@@ -1,11 +1,8 @@
 import Foundation
 
 enum KekkaiXPCSigningRequirement {
-    static func make(bundleIdentifier: String, teamIdentifierPrefix: String?) -> String? {
-        guard let teamIdentifierPrefix else { return nil }
-        let teamIdentifier = teamIdentifierPrefix.hasSuffix(".")
-            ? String(teamIdentifierPrefix.dropLast())
-            : teamIdentifierPrefix
+    static func make(bundleIdentifier: String, teamIdentifier: String?) -> String? {
+        guard let teamIdentifier else { return nil }
         guard teamIdentifier.count == 10,
               teamIdentifier.allSatisfy({ $0.isASCII && ($0.isUppercase || $0.isNumber) }) else {
             return nil

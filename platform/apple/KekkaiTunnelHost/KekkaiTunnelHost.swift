@@ -117,10 +117,10 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
         }
         let serviceName = Bundle.main.object(forInfoDictionaryKey: "KekkaiMachServiceName") as? String
             ?? "group.jp.kotoba.kekkai.service"
-        let teamIdentifierPrefix = Bundle.main.object(forInfoDictionaryKey: "KekkaiTeamIdentifierPrefix") as? String
+        let teamIdentifier = Bundle.main.object(forInfoDictionaryKey: "KekkaiSigningTeamID") as? String
         guard let requirement = KekkaiXPCSigningRequirement.make(
             bundleIdentifier: providerBundleIdentifier,
-            teamIdentifierPrefix: teamIdentifierPrefix
+            teamIdentifier: teamIdentifier
         ) else {
             completion(NSError(domain: "jp.kotoba.kekkai.xpc", code: 9,
                                 userInfo: [NSLocalizedDescriptionKey: "Kekkai signing team is not configured"]))
@@ -273,8 +273,12 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
         let connection = extensionConnection
         extensionConnectionLock.unlock()
         guard let connection else { return nil }
-        return connection.remoteObjectProxyWithErrorHandler { [weak self] error in
-            guard let self else { return }
+        return connection.remoteObjectProxyWithErrorHandler { [weak self, weak connection] error in
+            guard let self, let connection else { return }
+            self.extensionConnectionLock.lock()
+            let isCurrent = self.extensionConnection === connection
+            self.extensionConnectionLock.unlock()
+            guard isCurrent else { return }
             self.stopNodeTransport()
             DispatchQueue.main.async {
                 self.showError("Kekkai system extension connection failed", error)
@@ -318,7 +322,29 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
         actionForReplacingExtension existing: OSSystemExtensionProperties,
         withExtension extensionProperties: OSSystemExtensionProperties
     ) -> OSSystemExtensionRequest.ReplacementAction {
-        .replace
+        guard isNewerSystemExtension(
+            extensionProperties.bundleVersion,
+            than: existing.bundleVersion
+        ) else { return .cancel }
+        return .replace
+    }
+
+    private func isNewerSystemExtension(_ candidate: String, than installed: String) -> Bool {
+        func components(_ version: String) -> [Int]? {
+            let parts = version.split(separator: ".", omittingEmptySubsequences: false)
+            guard (1...3).contains(parts.count) else { return nil }
+            let values = parts.compactMap { Int($0) }
+            return values.count == parts.count ? values : nil
+        }
+
+        guard let candidate = components(candidate),
+              let installed = components(installed) else { return false }
+        for index in 0..<max(candidate.count, installed.count) {
+            let candidatePart = index < candidate.count ? candidate[index] : 0
+            let installedPart = index < installed.count ? installed[index] : 0
+            if candidatePart != installedPart { return candidatePart > installedPart }
+        }
+        return false
     }
 
     func request(
