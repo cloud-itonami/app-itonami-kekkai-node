@@ -1,3 +1,11 @@
+import Dispatch
 import NetworkExtension
 
-NEProvider.startSystemExtensionMode()
+func main() -> Never {
+    autoreleasepool {
+        NEProvider.startSystemExtensionMode()
+    }
+    dispatchMain()
+}
+
+main()
