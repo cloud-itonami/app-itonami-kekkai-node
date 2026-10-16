@@ -1,0 +1,189 @@
+(ns kekkai.node.heartbeat
+  "Node-side signer and HTTPS client for Kekkai control-plane heartbeats.
+
+  The wire vector and domain tag mirror `kekkai.heartbeat` in the control
+  plane. The Ed25519 DID seed is separate from the node's X25519 Noise key and
+  stays in a mode-0600 file; only signed candidate data leaves this process."
+  (:require [clojure.string :as string]
+            [ed25519.core :as ed25519]
+            [kekkai.node.endpoint :as endpoint]
+            ["node:fs" :as fs]
+            ["node:crypto" :as crypto]))
+
+(def ^:private signing-domain "kekkai.node-heartbeat.v1")
+(def ^:private netmap-read-signing-domain "kekkai.netmap-read.v1")
+(def max-endpoints 16)
+(def max-endpoint-length 512)
+
+(defn- payload-bytes [node-id {:keys [heartbeat/sequence heartbeat/issued-at endpoints]}]
+  (.encode (js/TextEncoder.)
+           (pr-str [signing-domain node-id sequence issued-at endpoints])))
+
+(defn sign
+  "Sign a complete endpoint vector using the enrolled Ed25519 seed."
+  [node-id sequence issued-at endpoints seed]
+  (let [message {:heartbeat/sequence sequence
+                 :heartbeat/issued-at issued-at
+                 :endpoints (vec endpoints)}]
+    (when-not (and (string? node-id) (seq node-id)
+                   (integer? sequence) (pos? sequence)
+                   (integer? issued-at)
+                   (vector? endpoints) (<= (count endpoints) max-endpoints)
+                   (every? #(and (string? %) (<= 1 (count %) max-endpoint-length)) endpoints))
+      (throw (ex-info "invalid heartbeat signing input"
+                      {:type :kekkai/invalid-heartbeat-signing-input})))
+    (assoc message :heartbeat/signature-hex
+           (ed25519/hexify (ed25519/sign seed (payload-bytes node-id message))))))
+
+(defn sign-netmap-read
+  "Sign a read-only bootstrap request with the enrolled heartbeat DID seed."
+  [node-id issued-at seed]
+  (when-not (and (string? node-id) (seq node-id) (integer? issued-at))
+    (throw (ex-info "invalid netmap-read signing input"
+                    {:type :kekkai/invalid-netmap-read})))
+  (ed25519/hexify
+   (ed25519/sign seed
+                 (.encode (js/TextEncoder.)
+                          (pr-str [netmap-read-signing-domain node-id issued-at])))))
+
+(defn candidate-strings
+  "Return a stable, complete wire vector from local and STUN candidates.
+
+  The UDP and STUN layers currently provide candidate strings, while callers
+  and tests may provide endpoint maps. Normalize both forms before signing;
+  treating a string as an endpoint map would silently serialize it as `:`."
+  [candidates]
+  (let [normalized (mapv (fn [candidate]
+                           (let [parsed (if (string? candidate)
+                                          (endpoint/parse candidate)
+                                          candidate)]
+                             (when-not (and (map? parsed)
+                                            (contains? #{:local :reflexive} (:kind parsed))
+                                            (string? (:host parsed))
+                                            (seq (:host parsed))
+                                            (integer? (:port parsed))
+                                            (<= 1 (:port parsed) 65535))
+                               (throw (ex-info "heartbeat candidate is not a direct endpoint"
+                                               {:type :kekkai/invalid-heartbeat-candidate})))
+                             (endpoint/->str parsed)))
+                         candidates)
+        values (vec (sort (distinct normalized)))]
+    (when (> (count values) max-endpoints)
+      (throw (ex-info "heartbeat candidate set exceeds the protocol limit"
+                      {:type :kekkai/too-many-heartbeat-candidates
+                       :count (count values)})))
+    (when-not (every? #(<= 1 (count %) max-endpoint-length) values)
+      (throw (ex-info "heartbeat candidate is outside the protocol length limit"
+                      {:type :kekkai/invalid-heartbeat-candidate})))
+    values))
+
+(defn- secure-file! [path]
+  (when-not (.existsSync fs path)
+    (throw (ex-info "heartbeat identity/sequence file is missing"
+                    {:type :kekkai/missing-heartbeat-file})))
+  (let [stat (.lstatSync fs path)]
+    (when (or (.isSymbolicLink stat) (not (.isFile stat)))
+      (throw (ex-info "heartbeat identity/sequence path must be a regular file"
+                      {:type :kekkai/invalid-heartbeat-file})))
+    stat))
+
+(defn load-identity!
+  "Read a 32-byte hex seed with owner-only permissions and bind it to node DID."
+  [{:keys [seed-file did]}]
+  (when-not (and (string? seed-file) (string? did) (seq did))
+    (throw (ex-info "heartbeat config requires :seed-file and :did"
+                    {:type :kekkai/invalid-heartbeat-config})))
+  (let [stat (secure-file! seed-file)
+        mode (.-mode stat)
+        text (string/trim (.readFileSync fs seed-file "utf8"))]
+    (when-not (zero? (bit-and mode 63))
+      (throw (ex-info "heartbeat seed file permissions must be 0600 or stricter"
+                      {:type :kekkai/insecure-heartbeat-seed-file})))
+    (when-not (re-matches #"(?i)[0-9a-f]{64}" text)
+      (throw (ex-info "heartbeat seed file must contain exactly 32 raw bytes in hex"
+                      {:type :kekkai/invalid-heartbeat-seed})))
+    (let [seed (ed25519/unhex text)
+          derived (ed25519/did-key-from-seed seed)]
+      (when-not (= did derived)
+        (throw (ex-info "heartbeat seed does not match the enrolled DID"
+                        {:type :kekkai/heartbeat-did-mismatch})))
+      {:seed seed :did derived})))
+
+(defn- read-sequence [path]
+  (if (.existsSync fs path)
+    (let [stat (secure-file! path)
+          mode (.-mode stat)
+          text (string/trim (.readFileSync fs path "utf8"))]
+      (when-not (zero? (bit-and mode 63))
+        (throw (ex-info "heartbeat sequence file permissions must be 0600 or stricter"
+                        {:type :kekkai/insecure-heartbeat-sequence-file})))
+      (when-not (re-matches #"[0-9]+" text)
+        (throw (ex-info "heartbeat sequence file is malformed"
+                        {:type :kekkai/invalid-heartbeat-sequence-file})))
+      (js/Number text))
+    0))
+
+(defn next-sequence!
+  "Persist the next positive sequence before any network request is attempted."
+  [path]
+  (when-not (and (string? path) (seq path))
+    (throw (ex-info "heartbeat config requires :sequence-file"
+                    {:type :kekkai/invalid-heartbeat-config})))
+  (let [next (inc (read-sequence path))
+        temp (str path ".tmp-" (.randomUUID crypto))]
+    (when (> next 9007199254740991)
+      (throw (ex-info "heartbeat sequence exhausted exact integer range"
+                      {:type :kekkai/heartbeat-sequence-exhausted})))
+    (try
+      (.writeFileSync fs temp (str next "\n")
+                      #js {:encoding "utf8" :mode 384 :flag "wx"})
+      (.renameSync fs temp path)
+      next
+      (catch :default error
+        (try (.unlinkSync fs temp) (catch :default _ nil))
+        (throw error)))))
+
+(defn- validate-url! [url]
+  (let [parsed (js/URL. url)
+        protocol (.-protocol parsed)
+        host (.-hostname parsed)
+        local? (contains? #{"localhost" "127.0.0.1" "[::1]"} host)]
+    (when-not (or (= "https:" protocol)
+                  (and (= "http:" protocol) local?))
+      (throw (ex-info "heartbeat endpoint must use HTTPS (HTTP is allowed only on loopback)"
+                      {:type :kekkai/insecure-heartbeat-url})))
+    parsed))
+
+(defn post!
+  "Post one signed heartbeat. Returns a Promise; non-202 responses fail closed."
+  [{:keys [url node-id sequence-file seed timeout-ms fetch-fn]
+    :or {timeout-ms 8000}}
+   candidates]
+  (let [parsed (validate-url! url)
+        sequence (next-sequence! sequence-file)
+        endpoints (candidate-strings candidates)
+        heartbeat (sign node-id sequence (js/Math.floor (/ (.now js/Date) 1000))
+                        endpoints seed)
+        base (string/replace url #"/+$" "")
+        request-url (str base "/v1/nodes/"
+                         (js/encodeURIComponent node-id) "/heartbeat")]
+    (when-not (and (= (.-origin parsed) (.-origin (js/URL. request-url)))
+                   (<= 1 timeout-ms 120000))
+      (throw (ex-info "invalid heartbeat request configuration"
+                      {:type :kekkai/invalid-heartbeat-config})))
+    (-> ((or fetch-fn js/fetch)
+         request-url
+         #js {:method "POST"
+              :headers #js {"content-type" "application/edn"}
+              :body (pr-str heartbeat)
+              ;; The body contains signed network candidates. Do not let fetch
+              ;; forward it to a redirect target outside the configured origin.
+              :redirect "error"
+              :signal (js/AbortSignal.timeout timeout-ms)})
+        (.then (fn [response]
+                 (if (= 202 (.-status response))
+                   {:accepted? true :sequence sequence}
+                   (throw (ex-info "heartbeat endpoint rejected the request"
+                                   {:type :kekkai/heartbeat-rejected
+                                    :status (.-status response)
+                                    :sequence sequence}))))))))

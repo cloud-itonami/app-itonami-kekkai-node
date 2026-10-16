@@ -2,7 +2,7 @@
 ;; Print (or write, with --write) the macOS residency for this node: the
 ;; LaunchDaemon plist and the split-DNS resolver file.
 ;;
-;;   kbb --backend sci --classpath "src:..." bin/install.cljk kekkai-node.edn [--write]
+;;   kbb --classpath "src:..." bin/install.cljk kekkai-node.edn [--write]
 ;;
 ;; Writing both paths needs root. This prints the privileged commands instead of
 ;; running them: an installer that silently `sudo`s is one you cannot review.
@@ -11,37 +11,75 @@
             ["node:fs" :as fs]
             ["node:path" :as path]))
 
+(defn- script-args [script-suffix]
+  (let [argv (vec (js->clj (.-argv js/process)))
+        script-index (last (keep-indexed
+                            (fn [i arg]
+                              (when (and (string? arg) (.endsWith arg script-suffix)) i))
+                            argv))]
+    (if (some? script-index)
+      (subvec argv (inc script-index))
+      (throw (js/Error. (str "cannot locate " script-suffix " in process arguments"))))))
+
 (defn -main [& args]
   (let [config-file (or (first args) "kekkai-node.edn")
         write? (some #{"--write"} args)
         config (cljs.reader/read-string (.readFileSync fs config-file "utf8"))
+        env (.-env js/process)
+        launchd-user (or (:launchd-user config)
+                         (aget env "SUDO_USER")
+                         (aget env "USER"))
+        runner (or (:runner config)
+                   (cond
+                     (get-in config [:packet-bridge :path]) :node
+                     (seq (:forwards config)) :stream-edge
+                     :else :agent))
+        _ (when-not (contains? #{:agent :stream-edge :packet-bridge :node} runner)
+            (throw (js/Error. ":runner must be :agent, :stream-edge, :packet-bridge, or :node")))
+        _ (when (and (seq (:forwards config))
+                     (not (contains? #{:stream-edge :node} runner)))
+            (throw (js/Error. "configured :forwards require :runner :stream-edge or :node")))
+        _ (when (and (contains? #{:packet-bridge :node} runner)
+                     (not (seq (get-in config [:packet-bridge :path]))))
+            (throw (js/Error. ":runner :packet-bridge/:node requires :packet-bridge :path")))
         label (or (:launchd-label config) launchd/default-label)
         root (.resolve path ".")
+        script-name (case runner
+                      :stream-edge "stream-edge.cljk"
+                      :packet-bridge "tun-agent.cljk"
+                      :node "node.cljk"
+                      "agent.cljk")
         plist (launchd/plist
                {:label label
-                :nbb (or (:nbb-path config) "/opt/homebrew/bin/nbb")
+                :kbb (or (:kbb-path config) "/opt/homebrew/bin/kbb")
                 :classpath (or (:classpath config)
                                "src:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src")
-                :script (.join path root "bin" "agent.cljk")
+                :service-user launchd-user
+                :launchd-path (or (:launchd-path config) launchd/default-search-path)
+                :script (.join path root "bin" script-name)
                 :config-file (.resolve path config-file)
                 :working-dir root})
-        resolver (launchd/resolver-file {:tailnet (:tailnet config)
-                                         :port (get-in config [:dns :port])})]
+        resolver (when (true? (get-in config [:dns :enabled?]))
+                   (launchd/resolver-file {:tailnet (:tailnet config)
+                                           :port (get-in config [:dns :port])}))]
     (if write?
       (do (.writeFileSync fs (launchd/plist-path label) plist)
-          (.mkdirSync fs "/etc/resolver" #js {:recursive true})
-          (.writeFileSync fs (:path resolver) (:content resolver))
-          (println (str "wrote " (launchd/plist-path label) " and " (:path resolver)))
+          (when resolver
+            (.mkdirSync fs "/etc/resolver" #js {:recursive true})
+            (.writeFileSync fs (:path resolver) (:content resolver)))
+          (println (str "wrote " (launchd/plist-path label)
+                        (when resolver (str " and " (:path resolver)))))
           (println "now run, as root:")
           (doseq [cmd (launchd/install-commands label)]
             (println (str "  " (kotoba.lang.text/join " " cmd)))))
       (do (println (str ";; " (launchd/plist-path label)))
           (println plist)
-          (println (str ";; " (:path resolver)))
-          (println (:content resolver))
+          (when resolver
+            (println (str ";; " (:path resolver)))
+            (println (:content resolver)))
           (println ";; privileged steps:")
           (doseq [cmd (launchd/install-commands label)]
             (println (str ";;   " (kotoba.lang.text/join " " cmd))))
           (println ";; re-run with --write (as root) to install")))))
 
-(apply -main (drop 3 (js->clj (.-argv js/process))))
+(apply -main (script-args "bin/install.cljk"))

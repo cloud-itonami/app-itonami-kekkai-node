@@ -1,0 +1,28 @@
+(ns kekkai.node.endpoint-test
+  (:require [kotoba.test :refer [deftest is]]
+            [kekkai.node.endpoint :as endpoint]))
+
+(deftest excludes-configured-ipv4-and-ipv6-hosts-from-candidates
+  (is (= ["192.168.1.25:41641" "220.146.177.126:41641"]
+         (endpoint/exclude-candidate-hosts
+          ["100.108.223.94:41641"
+           "192.168.1.25:41641"
+           "[fd7a:115c:a1e0::1234]:41641"
+           "220.146.177.126:41641"]
+          ["100.108.223.94" "fd7a:115c:a1e0::1234"]))))
+
+(deftest exclusion-matches-are-case-insensitive-and-support-endpoint-maps
+  (is (= [{:kind :reflexive :host "198.51.100.8" :port 41641}]
+         (endpoint/exclude-candidate-hosts
+          [{:kind :local :host "FD7A:115C:A1E0::1234" :port 41641}
+           {:kind :reflexive :host "198.51.100.8" :port 41641}]
+          ["fd7a:115c:a1e0::1234"]))))
+
+(deftest candidate-host-extracts-bracketed-ipv6-and-ipv4-endpoints
+  (is (= "fd7a:115c:a1e0::1234"
+         (endpoint/candidate-host "[fd7a:115c:a1e0::1234]:41641")))
+  (is (= "198.51.100.8" (endpoint/candidate-host "198.51.100.8:41641")))
+  (is (= "2001:db8::8"
+         (endpoint/candidate-host {:kind :reflexive
+                                   :host "2001:db8::8"
+                                   :port 41641}))))

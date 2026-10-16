@@ -62,7 +62,7 @@ socket; the `.cljs` files are sockets and timers.
 | `kekkai.node.launchd` | the LaunchDaemon plist and the split-DNS resolver file |
 | `kekkai.node.application` / `access-edge` / `signed-netmap` (cljs) | message framing over a session, a private-HTTP connector, and Ed25519 netmap-envelope verification — added alongside this work by a parallel session; tested, and `signed-netmap` is the beginning of the netmap-signature gap below |
 | `kekkai.node.funnel` / `message-plane` (cljs) | **kekkai funnel**: a public HTTPS listener on one edge node that publishes a service on a NAT'd node (see below); the plane is pacing + nack-driven re-send for application messages, shared with `access-edge` |
-| `kekkai.node.agent` (cljs) | the loop: one UDP socket, one relay client, N peers, a timer, a DNS listener |
+| `kekkai.node.agent` (cljs) | the loop: one UDP socket, an active relay client with signed-order failover, N peers, a timer, a DNS listener |
 | `relay_server` / `dns_server` / `stun` / `udp` (cljs) | the sockets |
 
 ## SSH over the overlay, without a TUN device
@@ -93,6 +93,149 @@ failed with `Connection timed out during banner exchange` — which is the contr
 that makes the first result mean anything, since ordinary Tailscale SSH to the
 same host works either way.
 
+### Murakumo CLI
+
+Murakumo can use this stream edge as an additional SSH path while retaining its
+existing Tailscale path. For SSH-only use, run a `stream-edge` agent on the Murakumo controller
+with one forward per node, using a local port unique to each peer:
+
+```clojure
+{:node/id "murakumo-controller"
+ :static {:priv "<controller-private-key>" :pub "<controller-public-key>"}
+ :netmap-file "/opt/kekkai/netmap.edn"
+ :netmap-authority-spki-b64 "<authority-public-key>"
+ :listen-port 41641
+ :runner :stream-edge
+ :forwards [{:listen-port 2222 :peer "judah" :port 22 :capability :ssh}
+            {:listen-port 2223 :peer "naphtali" :port 22 :capability :ssh}]}
+```
+
+Configure the matching Murakumo fleet entries with
+`:kekkai {:node-id "judah" :ssh-user "judah" :ssh-local-port 2222}` and choose the route
+explicitly:
+
+```bash
+kbb --backend sci src/murakumo/ops.cljk status --transport kekkai
+kbb --backend sci src/murakumo/task.cljk run --transport kekkai --n 1 --cmd hostname
+```
+
+Kekkai transport uses SSH to `127.0.0.1` at the configured local forwarder
+port; missing node IDs or ports are errors, with no route fallback. The signed
+netmap still has to grant the controller `:ssh` to port 22, and the remote
+node's service side must be running `kekkai.node.stream-edge`. The optional
+Murakumo admission ledger remains a separate fleet-membership check. This
+wiring does not disable or replace Tailscale.
+
+### Signed endpoint heartbeats
+
+The resident agent can report its current direct-connect candidates to the
+Kekkai control plane. The heartbeat signer is an enrolled Ed25519 `did:key`,
+separate from the node's Noise static key. Store its raw 32-byte seed in an
+owner-only file (`0600` or stricter) as 64 hex characters, and give the node a
+durable sequence file so restarts cannot replay an accepted heartbeat:
+
+Create a new heartbeat identity on the node with:
+
+```bash
+npm run heartbeat-keygen -- /etc/kekkai/node-heartbeat.seed
+```
+
+The command writes a new 0600 seed file without overwriting an existing file
+and prints only the public DID. Enroll that DID through the governed control
+plane before using it in the node configuration.
+
+```clojure
+:heartbeat {:url "https://kekkai-control.example"
+            :did "did:key:z6Mk..." ; must match this admitted node's enrolled DID
+            :seed-file "/etc/kekkai/node-heartbeat.seed"
+            :sequence-file "/var/lib/kekkai/heartbeat.sequence"
+            :interval-ms 30000}
+```
+
+The agent posts to
+`POST /v1/nodes/{node-id}/heartbeat` over HTTPS. It publishes the complete,
+sorted candidate set after startup and NAT discovery, when the set changes, and
+at the configured interval. An empty set withdraws old candidates. The
+control-plane ingress verifies the enrolled DID, signature, freshness, node
+authorization and monotonic sequence before storing the heartbeat; candidate
+addresses remain probe hints and grant no access by themselves.
+
+The heartbeat service binds only to loopback. Expose it to remote nodes through
+a TLS-terminating reverse proxy, and point `:url` at that HTTPS origin. A
+separate KBB Node reconciler watches the persisted control-plane snapshot and
+publishes changed per-node signed netmaps. The resident agent can run its
+authenticated watcher in-process, verify mirror heads, and install newer maps
+into `:netmap-file`; the standalone watcher CLI remains available for nodes
+that manage it as a separate service. Heartbeats only update endpoint
+candidates and do not install routes or change the node's ACL.
+
+```clojure
+;; /etc/kekkai/netmap-watch.edn on each resident node
+{:roots ["ssh://mirror-a/var/lib/kekkai/netmaps"
+         "ssh://mirror-b/var/lib/kekkai/netmaps"]
+ :subject "default/node-a"
+ :authority-spki-b64 "<pinned-authority-SPKI-base64>"
+ :output-file "/run/kekkai/netmap.signed.edn"
+ :poll-ms 5000}
+```
+
+```clojure
+;; resident agent config (embedded watcher)
+{:netmap-file "/run/kekkai/netmap.signed.edn"
+ :netmap-authority-spki-b64 "<same-pinned-authority-SPKI-base64>"
+ :netmap-watch {:roots ["ssh://mirror-a/var/lib/kekkai/netmaps"
+                        "ssh://mirror-b/var/lib/kekkai/netmaps"]
+                :subject "default/node-a"
+                :poll-ms 5000}}
+```
+
+When a signed cache already exists, the agent starts from it and refreshes in
+the background. With no cache, it verifies and installs the current signed map
+before opening the UDP socket. Agent status reports watcher state, and stopping
+the agent also stops its poller.
+
+Start the watcher with:
+
+```bash
+npm run netmap-watch -- /etc/kekkai/netmap-watch.edn --watch
+```
+
+The one-shot form without `--watch` is useful for deployment checks.
+The watcher accepts local roots and restricted `ssh://host/absolute/path` roots,
+refuses mirror split brain and rollback, verifies both Ed25519 signatures, and
+atomically replaces the node-readable file only when the signed netmap version
+advances.
+
+For a new node that cannot reach an SSH mirror before its first map arrives,
+configure Kekkai's authenticated HTTPS bootstrap endpoint instead. The watcher
+uses the same enrolled heartbeat DID seed, then verifies the authority-signed
+desired-state block and node-readable netmap before installation. Provision the
+seed file as `0600` and pin the authority SPKI out of band:
+
+```clojure
+;; standalone watcher config; the embedded watcher uses these same fields
+{:api-url "https://kekkai-control.example"
+ :node-id "node-a"
+ :subject "default/node-a"
+ :heartbeat {:did "did:key:z6Mk..."
+             :seed-file "/etc/kekkai/node-heartbeat.seed"}
+ :authority-spki-b64 "<pinned-authority-SPKI-base64>"
+ :output-file "/run/kekkai/netmap.signed.edn"
+ :poll-ms 5000}
+```
+
+For embedded cold start, put `:api-url`, `:node-id`, `:subject`, and `:poll-ms`
+under the resident agent's `:netmap-watch` map. Put `:did` and `:seed-file` in
+the agent's top-level `:heartbeat` config; the watcher uses that enrolled
+identity automatically. The client signs each `GET /v1/nodes/{node-id}/netmap`
+with a fresh timestamp.
+It permits public HTTPS origins; plain HTTP is accepted only for `localhost`,
+`127.0.0.1`, or `::1` development endpoints. After the first map is installed,
+the node can continue to refresh from the same API or switch to mirrors. This
+removes Tailscale as a bootstrap dependency when the public TLS endpoint and
+ordinary internet routing are available; it does not provision that endpoint
+or replace the OS tunnel setup described in [`docs/os-tunnel.md`](docs/os-tunnel.md).
+
 Why a reliable stream had to be written rather than borrowed: `peer` carries
 authenticated datagrams with no sequence numbers, acknowledgement or
 retransmission. A packet overlay does not need them — it hands datagrams to an
@@ -111,6 +254,7 @@ is the peer's own opinion of what it may do, which is the `fleet.edn` shape
 
 ```bash
 npm run e2e:stream       # relay + two agents + a real TCP service, over real UDP
+npm run e2e:bootstrap-ssh # signed relay-free bootstrap + OpenSSH + Murakumo CLI, on loopback
 ```
 
 ## kekkai funnel — a public service on a NAT'd node, without Tailscale or Cloudflare
@@ -282,9 +426,14 @@ npm run e2e:funnel   # relay + edge + connector + upstream, over real UDP
 
 ## Design decisions worth knowing before changing anything
 
-**Connectivity first, optimization second.** Every peer starts on the relay, which
-works behind anything. A node is never unreachable *because* discovery is still in
-progress. Direct paths are an upgrade applied when a probe proves one works.
+**Use the relay when it is available; bootstrap directly when it is not.** With a
+connected relay, the first Noise IK session uses it and direct paths are an
+upgrade after an authenticated probe. If there is no relay session but the signed
+netmap already has peer endpoints, both nodes send small one-way UDP punches and
+the deterministic initiator sends Noise IK directly to those candidates. A direct
+handshake response is sent only to a source listed in that peer's signed
+candidates. The established session still needs an authenticated disco pong
+before Kekkai selects the direct path.
 
 **A candidate is a hypothesis, never a fact.** Netmap endpoints are stale hints;
 `disco` probes all of them and trusts only a reply. Hole punching is a
@@ -321,10 +470,35 @@ real: a netmap rollout is a coordinated step.
  :static       {:priv "<hex32>" :pub "<hex32>"}   ; this node's X25519 identity
  :netmap-file  "/opt/kekkai/netmap.edn"
  :listen-port  41641
- :stun-servers ["stun.l.google.com:19302"]
+ :stun-servers ["stun.l.google.com:19302" "stun1.l.google.com:19302"]
+ :stun-timeout-ms 5000
+ :candidate-excluded-hosts [] ; optional exact interface IPs never used as peer candidates
  :dns          {:enabled? true :port 5354}
+ :forwards     []
  :tick-ms      1000}
 ```
+
+Use two STUN destinations if you want Kekkai to classify whether the NAT changes
+its public mapping by destination. With fewer than two successful responses,
+`:symmetric?` is `nil` (unknown), not a claim that direct punching will work.
+Periodic agent status includes the NAT discovery state, candidate list, and
+number of responding servers alongside each peer's active route report.
+
+Set `:candidate-excluded-hosts` to exact local or peer IP addresses that must
+not be used for Kekkai discovery. The filter applies to interface, STUN, signed
+netmap, and peer-discovery candidates; it does not filter the configured relay
+address. This is useful when testing Kekkai alongside another overlay: supply
+that overlay's current interface addresses so a `:direct` Kekkai route cannot
+silently ride on the other overlay. Matching is case-insensitive and exact; if
+an interface address changes, update the list.
+
+Relay-free cold start depends on the control plane publishing each peer's
+current endpoint candidates in the signed netmap before the first session. STUN
+results are local until the publisher distributes them; the nodes cannot use an
+encrypted `call-me-maybe` exchange before a Noise session exists. The three-byte
+bootstrap punch is deliberately unauthenticated and receives no reply. If no
+signed candidate is reachable, a relay is still required as fallback; symmetric
+or restrictive NATs may prevent direct setup.
 
 The netmap this consumes (published by the control plane):
 
@@ -347,29 +521,48 @@ The netmap this consumes (published by the control plane):
 npm install
 
 # a relay (one publicly reachable UDP port; no state, no database)
-kbb --backend sci --classpath "$CP" bin/relay.cljk relay.edn
+kbb --classpath "$CP" bin/relay.cljk relay.edn
 
 # a node agent
-kbb --backend sci --classpath "$CP" bin/agent.cljk kekkai-node.edn
+kbb --classpath "$CP" bin/agent.cljk kekkai-node.edn
+
+# a controller with :runner :stream-edge and configured :forwards
+kbb --classpath "$CP" bin/stream-edge.cljk kekkai-node.edn
+
+# a VPN node with one agent shared by TUN packets and SSH forwards
+kbb --classpath "$CP" bin/node.cljk kekkai-tun-agent.edn
 
 # macOS residency: print the LaunchDaemon + split-DNS resolver, then install
-kbb --backend sci --classpath "$CP" bin/install.cljk kekkai-node.edn
-sudo kbb --backend sci --classpath "$CP" bin/install.cljk kekkai-node.edn --write
+kbb --classpath "$CP" bin/install.cljk kekkai-node.edn
+sudo kbb --classpath "$CP" bin/install.cljk kekkai-node.edn --write
 
 # CP="src:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src"
 ```
 
+`bin/install.cljk` chooses `bin/node.cljk` when a packet-bridge path is
+configured, so TUN packets and optional SSH forwards share one agent identity.
+Use `:runner :stream-edge` for an SSH-only node, including a target that only
+accepts inbound streams and connects to its loopback `sshd`. DNS resolver
+output is written only when `:dns :enabled?` is true.
+
 Residency is a **LaunchDaemon**, not a LaunchAgent, for the reason murakumo's
 README documents the hard way: a user agent dies with the login session and does
 not even appear in `launchctl list` over SSH. MagicDNS binds **5354, not 53**, so
-the agent needs no root; `/etc/resolver/<tailnet>` points the system at it.
+the agent needs no root; `/etc/resolver/<tailnet>` points the system at it. The
+plist sets `UserName` to `:launchd-user`; if omitted, the installer uses
+`SUDO_USER` and then `USER`. Root is rejected so the persistent network agent
+runs with the node account's permissions. The plist sets `PATH` explicitly
+because launchd does not load shell profiles; set `:launchd-path` when KBB or
+Node lives outside the Homebrew and system directories. Keep the node config
+and private key material readable only by the service account (for example,
+mode `0600` when `:static` keys are stored in the config file).
 
 ## Verification
 
 ```bash
 kbb -M:test                                              # pure cores, JVM
-kbb --backend sci --classpath "$CP" run-tests.cljk                         # pure cores, cljs
-kbb --backend sci --classpath "$CP" test/e2e.cljk                          # real UDP, end to end
+kbb --classpath "$CP" run-tests.cljk                         # pure cores, cljs
+kbb --classpath "$CP" test/e2e.cljk                          # real UDP, end to end
 kbb -M:lint
 ```
 
@@ -397,6 +590,12 @@ a relay process, two agents, and these checks, all passing:
   change path
 - MagicDNS answers a real DNS query with the peer's overlay address
 - names outside the tailnet are refused, not NXDOMAINed
+
+`test/bootstrap_e2e.cljk` separately starts two agents from signed peer
+endpoints with an empty relay list. It verifies direct Noise sessions, direct
+path selection, and an authorized SSH-capability TCP stream from cold start.
+This is a real-socket loopback check; it does not qualify every NAT type or
+replace a two-host test.
 
 Two bugs the E2E found that no unit test with one handshake in flight could have,
 now covered by regression tests in `peer_test`:
@@ -504,26 +703,44 @@ provider reserved for browsers.
   One port per peer still works and is still the cheaper answer where the
   service cannot be changed: `permitted?` is per `(from, to, capability,
   port)`, so a peer granted only its own port cannot reach another's.
-- **No real-NAT measurement.** The E2E's "direct path" is loopback, so it
-  exercises the hole-punch *protocol*, not any particular NAT. Two peers both
-  behind symmetric NATs cannot be punched at all, by construction, and stay
-  relayed — `disco/path-report` and `stun/candidates`'s `:symmetric?` are the
-  instruments for finding out what this fleet's NATs actually do.
-- **No L3/TUN plane.** This carries overlay sessions and forwards service traffic;
-  it does not present a network interface, so it is not a drop-in for a
-  `100.x.y.z`-routes-everything VPN. `:node/overlay-ip` is used for naming
-  (MagicDNS) rather than for routing packets. **What this used to block —
-  `ssh` — no longer needs it**: `kekkai.node.stream` + `kekkai.node.stream-edge`
-  forward TCP in userspace (see "SSH over the overlay" above). Everything that
-  is not a forwardable TCP service still needs the TUN plane.
-- **`netmap/permitted?` (port-level) and `netmap/sessionable` (inbound-only
-  edges) exist and are tested, but the agent does not enforce them yet** — it
-  gates on `dialable`/`:overlay` only.
-- Rekeying is *reported* (`:rekey-due`) and sessions expire correctly, but the
-  agent does not yet proactively re-handshake before expiry, so a long-lived
-  session has a gap at the 180 s boundary until the next dial.
-- One relay only: `relay/home` selects from measured latencies, but the agent uses
-  the first relay in the netmap and does not probe a mesh of them.
+- **Relay-free cold start across independent underlays is not yet verified with
+  the current source.** A two-host run verified direct Kekkai traffic, OpenSSH,
+  and the Murakumo CLI after a relay-assisted bootstrap. The current change also
+  passed a signed-endpoint, no-relay loopback E2E with real OpenSSH and the
+  Murakumo CLI over the same direct path. Re-running the current source on an
+  independent host is still required to qualify cold start across underlays.
+  Symmetric or restrictive NATs may prevent direct setup, so the relay remains
+  the fallback.
+- **The packet bridge carries raw IP through a signed route.** The node verifies
+  its Ed25519 netmap, selects the longest matching authorized `:tun` route, and
+  checks inbound packet authority. `test/tun_e2e.cljk` exercises a signed netmap
+  and a packet crossing Noise into the exit bridge. The bridge is a local
+  framed socket for an OS adapter; that E2E does not install a system route or
+  establish a production VPN interface. Apple entitlements and device
+  installation, Android native isolated transport and physical Arm64 proof,
+  and a signed first-party Windows driver remain release gates. See
+  [`docs/os-tunnel.md`](docs/os-tunnel.md).
+  `npm run e2e:apple-packet-bridge` substitutes the production Swift
+  `KekkaiLocalNodeTransport` for the client-side Node shim, then verifies that
+  a raw IPv4 packet reaches the exit bridge over signed Kekkai/Noise. It excludes
+  local interface candidates and uses only the test's loopback relay; it does
+  not install or activate the Network Extension.
+- **Stream edges enforce capability and port grants.** The agent uses
+  `netmap/sessionable` to hold sessions for authorized inbound and outbound
+  edges, and each service edge checks `netmap/permitted?` before opening the
+  requested port. The packet bridge separately checks the signed `:tun` route
+  for outbound packets and inbound peer authorization.
+- Peer sessions proactively rekey with fresh Noise IK handshakes. The responder
+  stages the last three retry handshakes and accepts the matching new session
+  when its first packet arrives; previous receive sessions remain valid for a
+  short grace window so UDP reordering does not break an active stream. The
+  timer, retry reordering, expiry enforcement, and stream continuity across a
+  real-socket rekey are covered by peer tests and `test/stream_e2e.cljk`.
+- Relay failover is sequential in signed netmap order. The agent starts with the
+  first relay and advances after registration or liveness timeout; a two-relay
+  localhost E2E stops the primary and verifies both nodes re-register to the
+  backup before packet, stream, SSH, and Murakumo CLI traffic continues. There is
+  no latency-based parallel selection or independent-NAT reachability proof yet.
 
 ## Design record
 

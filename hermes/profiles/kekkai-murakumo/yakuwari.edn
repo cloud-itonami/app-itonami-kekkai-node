@@ -1,0 +1,19 @@
+;; Unlisted capabilities are denied. This profile has no scheduled or
+;; unattended authority; signing and system VPN changes remain owner-gated.
+{:yakuwari/id :kekkai-murakumo
+ :yakuwari/project "kotoba-lang/kekkai-node"
+ :yakuwari/objective "Verify and maintain the Kekkai-backed Murakumo node path with bounded, attributable evidence."
+ :yakuwari/runners [{:runner :hermes :weight 1}]
+ :yakuwari/capabilities
+ [{:capability :kekkai.read_source :decision :autonomous}
+  {:capability :kekkai.review_source :decision :autonomous}
+  {:capability :kekkai.run_local_verification :decision :autonomous}
+  {:capability :kekkai.build_unsigned :decision :autonomous}
+  {:capability :kekkai.modify_source :decision :approval-required}
+  {:capability :kekkai.git_push :decision :approval-required}
+  {:capability :kekkai.git_merge :decision :approval-required}
+  {:capability :kekkai.use_signing_identity :decision :approval-required}
+  {:capability :kekkai.install_or_enable_vpn :decision :approval-required}
+  {:capability :kekkai.change_control_plane :decision :blocked}
+  {:capability :kekkai.export_private_keys :decision :blocked}
+  {:capability :kekkai.enable_cron :decision :blocked}]}

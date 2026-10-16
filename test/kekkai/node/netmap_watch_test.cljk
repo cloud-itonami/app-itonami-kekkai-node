@@ -1,0 +1,201 @@
+(ns kekkai.node.netmap-watch-test
+  (:require [kotoba.test :refer [deftest is async testing]]
+            [cljs.reader :as edn]
+            [ipns.core :as ipns]
+            [kekkai.node.netmap-watch :as watch]
+            [kekkai.node.signed-netmap :as signed-netmap]
+            [kekkai.node.heartbeat-keygen :as heartbeat-keygen]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+(defn- utf8 [value]
+  (.from js/Buffer value "utf8"))
+
+(defn- base64 [bytes]
+  (.toString bytes "base64"))
+
+(defn- signed-bytes [private-key bytes]
+  (.sign crypto nil bytes private-key))
+
+(defn- authority []
+  (let [pair (.generateKeyPairSync crypto "ed25519")
+        private-key (.-privateKey pair)
+        public-der (.export (.-publicKey pair)
+                            #js {:format "der" :type "spki"})
+        raw (.subarray public-der (- (.-length public-der) 32))]
+    {:private-key private-key
+     :spki (base64 public-der)
+     :name (ipns/pubkey->name (vec (array-seq raw)))}))
+
+(defn- netmap-envelope [{:keys [private-key spki]} netmap]
+  (let [netmap (merge {:netmap/version 1
+                       :netmap/tailnet "watch.test"
+                       :netmap/self {:node/id "node-a" :node/key "aabb"}
+                       :netmap/peers [] :netmap/edges [] :netmap/relays []}
+                      netmap)
+        payload (utf8 (pr-str netmap))]
+    {:netmap/payload-b64 (base64 payload)
+     :netmap/signature-b64 (base64 (signed-bytes private-key payload))
+     :netmap/signer-spki-b64 spki
+     :netmap/sha256 (-> (.createHash crypto "sha256")
+                        (.update payload)
+                        (.digest "hex"))}))
+
+(defn- desired-envelope [{:keys [private-key spki name]} subject epoch netmap]
+  (let [node-envelope (netmap-envelope {:private-key private-key :spki spki}
+                                       netmap)
+        payload (utf8 (pr-str node-envelope))
+        statement (pr-str {:desired/schema "kekkai.desired-state/v1"
+                           :desired/kind :kekkai/netmap
+                           :desired/subject subject
+                           :desired/name name
+                           :desired/epoch epoch
+                           :desired/previous-cid nil
+                           :desired/payload-cid (watch/cidv1-raw payload)
+                           :desired/payload-b64 (base64 payload)})
+        statement-bytes (utf8 statement)]
+    {:desired/cid (watch/cidv1-raw statement-bytes)
+     :desired/statement-b64 (base64 statement-bytes)
+     :desired/signature-b64 (base64 (signed-bytes private-key statement-bytes))
+     :desired/signer-spki-b64 spki
+     :node-envelope node-envelope}))
+
+(defn- write-publication! [roots subject envelope]
+  (let [subject-key (watch/cidv1-raw (utf8 subject))
+        block-file (str "blocks/" (:desired/cid envelope) ".edn")
+        head (select-keys envelope [:desired/cid])
+        head (assoc head :desired/name (:desired/name
+                                        (edn/read-string
+                                         (.toString (.from js/Buffer
+                                                             (:desired/statement-b64 envelope)
+                                                             "base64") "utf8")))
+                         :desired/subject subject
+                         :desired/epoch
+                         (:desired/epoch
+                          (edn/read-string
+                           (.toString (.from js/Buffer
+                                               (:desired/statement-b64 envelope)
+                                               "base64") "utf8"))))]
+    (doseq [root roots]
+      (.mkdirSync fs (path/join root "blocks") #js {:recursive true})
+      (.mkdirSync fs (path/join root "heads") #js {:recursive true})
+      (.writeFileSync fs (path/join root block-file)
+                      (pr-str (dissoc envelope :node-envelope))
+                      #js {:encoding "utf8" :mode 384})
+      (.writeFileSync fs (path/join root "heads" (str subject-key ".edn"))
+                      (pr-str head) #js {:encoding "utf8" :mode 384}))))
+
+(defn- temp-root []
+  (.mkdtempSync fs (path/join (.tmpdir os) "kekkai-netmap-watch-test-")))
+
+(deftest raw-cid-matches-ipfs-vector
+  (is (= "bafkreicysg23kiwv34eg2d7qweipxwosdo2py4ldv42nbauguluen5v6am"
+         (watch/cidv1-raw (utf8 "hello\n")))))
+
+(deftest watcher-installs-only-verified-newer-netmaps
+  (testing "signed desired-state heads update the file and remain idempotent"
+    (let [root (temp-root)
+          roots [(path/join root "mirror-a") (path/join root "mirror-b")]
+          identity (authority)
+          subject "default/node-a"
+          output-file (path/join root "netmap.signed.edn")
+          config-file (path/join root "netmap-watch.edn")
+          config {:roots roots :subject subject :output-file output-file
+                  :authority-spki-b64 (:spki identity)}
+          first-envelope (desired-envelope identity subject 1
+                                           {:netmap/version 1})]
+      (write-publication! roots subject first-envelope)
+      (.writeFileSync fs config-file (pr-str config)
+                      #js {:encoding "utf8" :mode 384})
+      (is (= :installed (:status (watch/run-once! config-file))))
+      (let [installed (signed-netmap/verify-envelope
+                       (.readFileSync fs output-file "utf8") (:spki identity))]
+        (is (= 1 (:netmap/version installed))))
+      (is (= :unchanged (:status (watch/install-current! config))))
+      (write-publication! roots subject
+                          (desired-envelope identity subject 2
+                                            {:netmap/version 2}))
+      (is (= :installed (:status (watch/install-current! config))))
+      (is (= 2 (:netmap/version
+                (signed-netmap/verify-envelope
+                 (.readFileSync fs output-file "utf8") (:spki identity)))))
+      (write-publication! roots subject
+                          (desired-envelope identity subject 3
+                                            {:netmap/version 1}))
+      (let [error (try
+                    (watch/install-current! config)
+                    nil
+                    (catch :default error error))]
+        (is (= :kekkai/netmap-version-rollback (-> error ex-data :type))))
+      (is (= 2 (:netmap/version
+                (signed-netmap/verify-envelope
+                 (.readFileSync fs output-file "utf8") (:spki identity))))))))
+
+(deftest watcher-rejects-malformed-mirror-cids-before-reading-block-path
+  (let [root (temp-root)
+        roots [(path/join root "mirror")]
+        identity (authority)
+        subject "default/node-a"
+        subject-key (watch/cidv1-raw (utf8 subject))
+        output-file (path/join root "netmap.signed.edn")]
+    (.mkdirSync fs (path/join (first roots) "heads") #js {:recursive true})
+    (.writeFileSync fs (path/join (first roots) "heads"
+                                  (str subject-key ".edn"))
+                    (pr-str {:desired/cid "../../unsafe"
+                             :desired/name (:name identity)
+                             :desired/subject subject
+                             :desired/epoch 1})
+                    #js {:encoding "utf8" :mode 384})
+    (let [error (try
+                  (watch/pull-netmap roots subject (:spki identity))
+                  nil
+                  (catch :default error error))]
+      (is (= :kekkai/invalid-desired-cid (-> error ex-data :type))))))
+
+(deftest authenticated-http-read-disallows-redirects-and-bounds-the-body
+  (async done
+    (let [root (temp-root)
+          identity (authority)
+          subject "default/node-a"
+          seed-file (path/join root "heartbeat.seed")
+          output-file (path/join root "netmap.signed.edn")
+          heartbeat (heartbeat-keygen/generate! seed-file)
+          options (atom nil)
+          config {:api-url "https://kekkai.example/api"
+                  :node-id "node-a"
+                  :heartbeat heartbeat
+                  :subject subject
+                  :authority-spki-b64 (:spki identity)
+                  :output-file output-file
+                  :fetch-fn (fn [_request-url request-options]
+                              (reset! options request-options)
+                              (js/Promise.resolve #js {:status 302}))}
+          finish (fn []
+                   (.rmSync fs root #js {:recursive true :force true})
+                   (done))]
+      (-> (watch/install-current! config)
+          (.then (fn [_]
+                   (is false "redirect response unexpectedly installed")
+                   (finish)))
+          (.catch
+           (fn [_]
+             (is (= "error" (.-redirect @options)))
+             (let [limited (assoc config
+                                  :fetch-fn
+                                  (fn [_request-url request-options]
+                                    (reset! options request-options)
+                                    (js/Promise.resolve
+                                     (js/Response.
+                                      "x"
+                                      #js {:status 200
+                                           :headers #js {"content-length" "16777217"}}))))]
+               (-> (watch/install-current! limited)
+                   (.then (fn [_]
+                            (is false "oversized response unexpectedly installed")
+                            (finish)))
+                   (.catch (fn [error]
+                             (is (= "netmap HTTP response exceeds the read limit"
+                                    (get (ex-data error) :message)))
+                             (finish)))))))))))

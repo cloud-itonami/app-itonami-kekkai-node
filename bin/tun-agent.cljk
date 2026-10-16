@@ -1,0 +1,16 @@
+#!/usr/bin/env kbb
+;; Run the signed-route packet bridge agent.
+;;
+;;   kbb --classpath "src:..." bin/tun-agent.cljk kekkai-node.edn
+(ns tun-agent-main
+  (:require [kekkai.node.packet-bridge :as packet-bridge]))
+
+(let [argv (vec (js->clj (.-argv js/process)))
+      script-index (last (keep-indexed
+                          (fn [i arg]
+                            (when (and (string? arg)
+                                       (.endsWith arg "bin/tun-agent.cljk")) i))
+                          argv))]
+  (when-not (some? script-index)
+    (throw (js/Error. "cannot locate bin/tun-agent.cljk in process arguments")))
+  (apply packet-bridge/-main (subvec argv (inc script-index))))

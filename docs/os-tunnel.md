@@ -34,9 +34,9 @@ A signed netmap grants both session establishment and packet forwarding:
 ```
 
 Route selection is longest-prefix. Two equal best routes are ambiguous and
-therefore denied. Relay and public mTLS management IPs must be excluded from
-the installed default route so the tunnel cannot recursively capture its own
-control traffic.
+therefore denied. The OS tunnel installs the validated prefixes from the
+directed signed `:tun` grants. Relay and public mTLS management IPs are added as
+host exclusions before the node releases queued underlay traffic.
 
 ## Platform adapters
 
@@ -48,10 +48,86 @@ control traffic.
 | Linux | `/dev/net/tun`, `IFF_TUN | IFF_NO_PI` | local framed bridge; Node rechecks signed route |
 | Windows | `\\.\Global\KekkaiTun` contract | userspace host; first-party NDIS package required |
 
-The Apple adapter captures IPv4 and IPv6 default routes, excludes configured
-relay addresses, sets an MTU of at least 1280, validates IPv4 total length and
-IPv6 payload length, and drops when the signed Kekkai transport factory is not
-installed.
+The Apple adapter first waits for the local-node bridge and its initial
+underlay snapshot, then installs only route prefixes from currently authorized,
+directed `:tun` grants in the verified signed netmap. A missing route set fails
+startup without changing the host route table. A signed `0.0.0.0/0` or `::/0`
+is an explicit full-tunnel grant; otherwise the OS uses split routes and normal
+internet traffic stays on the existing path. DNS settings are changed only
+when the provider configuration includes explicit servers. The node resolves
+the configured STUN and signed relay destinations plus signed peer candidates;
+the bridge publishes those IPs in a versioned `KKB1` control frame. The
+provider adds them as host-route exclusions, then acknowledges the installed
+address set. The node queues UDP sends to unacknowledged hosts. It fails startup
+if any required host cannot be resolved. New candidate snapshots update
+exclusions while the tunnel runs; the node pauses sends to changed hosts until
+the updated routes are acknowledged, and refreshes DNS answers every 60
+seconds. The node also resolves configured heartbeat and netmap API origins,
+plus configured SSH mirror roots, and publishes their addresses through the
+same exclusion snapshot so control-plane polling and Murakumo CLI downloads
+stay on the physical underlay. Kekkai-node uses one dual-stack UDP socket for
+IPv4 and IPv6, resolves relay and STUN hostnames to both address families, and
+rechecks the route guard after asynchronous DNS before sending. STUN IPv6
+mappings and relay literals use the `[address]:port` candidate format. The provider sets an MTU of at least
+1280, validates IPv4 total length and IPv6
+payload length, and drops unless an installed direct transport or the default
+local-node bridge is ready. The default transport is
+`KekkaiLocalNodeTransport`: it uses a
+Network.framework UNIX-domain connection to the local Kekkai-node packet
+bridge, with the same four-byte big-endian length framing as the Linux bridge.
+The tunnel provider configuration key `packetBridgePath` must match the node's
+`:packet-bridge :path`; the menu-bar host defaults to the
+`group.jp.kotoba.kekkai` app-group container and lets the operator set the
+matching node socket path. Node continues to enforce the signed netmap, Noise
+peer identity, route grants, and relay/direct selection. A missing bridge fails
+tunnel startup, and a later bridge failure cancels the tunnel rather than
+routing packets outside it.
+
+`platform/apple/project.yml` generates a macOS menu-bar host app and embeds the
+Packet Tunnel app extension. The host can save/load the VPN profile, connect or
+disconnect, and configure the shared socket path. Both targets carry the
+`group.jp.kotoba.kekkai` app-group entitlement; the extension also carries the
+Packet Tunnel and outbound-network entitlements. Set the Kekkai node's
+`:packet-bridge :path` to the same socket path shown in the host app. The app
+group must be registered for the App ID and included in the signing profile.
+The Kekkai-node process that creates the socket must also be authorized to use
+that group container; the extension's entitlement does not grant access to a
+separate CLI process. Package the node launcher as a signed group member, or
+verify the supported macOS user-authorization path for the exact launcher.
+
+Build an arm64 app and extension without a Developer ID signature or provisioning profile with:
+
+```sh
+cd platform/apple
+xcodegen generate --spec project.yml
+KOTOBA_BIN=/path/to/amu/bin/kotoba \
+KOTOBA_IOS_RUNTIME_DIR=/path/to/amu/runtime/ios \
+KBB_ENGINE=/path/to/nbb/cli.js \
+xcodebuild -project KekkaiTunnel.xcodeproj -scheme KekkaiTunnelHost \
+  -configuration Debug -destination 'generic/platform=macOS' -sdk macosx \
+  CODE_SIGNING_ALLOWED=NO ARCHS=arm64 ONLY_ACTIVE_ARCH=YES build
+```
+
+The extension target's build phase compiles and links the macOS Kotoba packet
+plane. This build proves the app and extension compile together; it does not
+prove the signed extension can access the daemon socket or run as an active VPN
+provider.
+
+This local bridge is a host IPC boundary, not the overlay transport itself. The
+macOS Network Extension sandbox, socket ownership/permissions, signed extension
+target, node-process access to the app-group container, and provisioning profile
+must be verified in the packaged app before claiming an operative system
+tunnel. An ordinary Swift process can typecheck and exercise the framed socket,
+but that does not prove the extension can open the installed daemon's socket.
+
+The provider currently learns exclusions through the local node's authenticated
+netmap and authenticated peer discovery state. The local socket protocol gates
+UDP datagrams to a host until the extension acknowledges its installed
+exclusion routes. This closes the candidate-discovery race at the node's UDP
+send boundary. The independent-network full-tunnel gate remains open until the
+packaged extension and daemon pass this behavior on a second physical network.
+Static relay exclusions alone are not enough. Do not enable this profile for
+production full-route use yet.
 
 The Android adapter creates a blocking dual-stack `VpnService`, parses and
 bounds every packet, and drops while the injected Kekkai transport is not
@@ -92,15 +168,25 @@ Nothing in this change uninstalls or disables Tailscale.
 ```sh
 npm test
 npm run build:packet-plane
+KOTOBA_BIN=/path/to/amu/bin/kotoba \
+  KOTOBA_IOS_RUNTIME_DIR=/path/to/amu/runtime/ios \
+  npm run test:apple-packet-plane
 npm run test:android-tunnel
 cargo check --manifest-path platform/desktop/Cargo.toml
 swiftc -typecheck -framework NetworkExtension \
   platform/apple/Sources/KekkaiTunnel/*.swift
 ```
 
-Apple device execution additionally requires the Network Extension entitlement,
-an App ID/provisioning profile, compilation and linking of
-`packet-plane-ios.S`, `kotoba_ios_host.c`, and
-`KotobaPacketPlaneBridge.c`, and installation on a signed extension target.
-These Apple-controlled credentials are deployment inputs, not repository
-secrets.
+The Apple static packet-plane host currently targets arm64 macOS and requires
+`KOTOBA_BIN` plus `KOTOBA_IOS_RUNTIME_DIR` when those tools are not next to the
+Kekkai-node checkout. `package-macos` emits a macOS Mach-O object; the Apple
+build script archives it with the static host and the Kekkai bridge.
+If the Amu checkout has no local `node_modules/nbb/cli.js`, also set
+`KBB_ENGINE` to an installed Nbb `cli.js` file.
+
+Apple execution still requires the Network Extension and app-group capabilities
+on the registered App IDs, a matching provisioning profile, code signing, and
+installation/approval of the embedded extension. Those Apple-controlled
+credentials are deployment inputs, not repository secrets. Only after the
+signed extension opens the shared daemon socket and completes a physical
+network run can this count as an operative system tunnel.

@@ -1,0 +1,80 @@
+(ns kekkai.node.runtime
+  "One Kekkai identity with both stream services and the signed packet bridge.
+
+  TUN and SSH are data-plane services of one node. Starting them as separate
+  agents would bind two UDP identities and compete for the same relay
+  registration, so this runtime owns one agent and attaches both services to
+  its event stream."
+  (:require [kekkai.node.agent :as agent]
+            [kekkai.node.packet-bridge :as packet-bridge]
+            [kekkai.node.stream-edge :as stream-edge]
+            [cljs.reader :as reader]
+            ["node:fs" :as fs]))
+
+(defn- event-handler [stream-registry handle-ref packet-client emit refresh-ref]
+  (let [stream-event (stream-edge/event-handler stream-registry handle-ref)
+        packet-event (packet-bridge/event-handler handle-ref packet-client emit
+                                                  refresh-ref)]
+    (fn [event]
+      (stream-event event)
+      (packet-event event))))
+
+(defn start
+  "Start one agent, then attach stream forwarding and the packet bridge.
+
+  Requires `:packet-bridge :path`; `:forwards` is optional and uses the same
+  shape as `kekkai.node.stream-edge`. The returned :stop closes both services
+  before stopping the single shared agent."
+  [{:keys [config on-event]
+    :or {on-event agent/log-event}}]
+  (let [_ (packet-bridge/prepare config)
+        stream-registry (atom {})
+        packet-client (atom nil)
+        handle-ref (atom nil)
+        refresh-ref (atom (fn [_] nil))
+        emit (fn [event] (on-event event))]
+    (-> (agent/start {:config config
+                      :on-event (event-handler stream-registry handle-ref
+                                               packet-client emit refresh-ref)})
+        (.then
+         (fn [agent-handle]
+           (reset! handle-ref agent-handle)
+           (try
+             (let [packet-component
+                   (packet-bridge/attach agent-handle config packet-client emit
+                                          refresh-ref)]
+               (-> (js/Promise.resolve nil)
+                   (.then (fn [_]
+                            (stream-edge/attach agent-handle config stream-registry)))
+                   (.then
+                    (fn [stream-component]
+                      (assoc agent-handle
+                             :packet-server (:packet-server packet-component)
+                             :stream-registry stream-registry
+                             :forwarders (:forwarders stream-component)
+                             :principal-endpoint (:principal-endpoint stream-component)
+                             :stop (fn []
+                                     ((:stop stream-component))
+                                     ((:stop packet-component))
+                                     ((:stop agent-handle))))))
+                   (.catch
+                    (fn [error]
+                      ((:stop packet-component))
+                      ((:stop agent-handle))
+                      (js/Promise.reject error)))))
+             (catch :default error
+               ((:stop agent-handle))
+               (js/Promise.reject error))))))))
+
+(defn -main [& args]
+  (let [config-path (or (first args) "kekkai-node.edn")
+        config (reader/read-string (.readFileSync fs config-path "utf8"))]
+    ;; Return no handle: it contains the node's Noise private key and must not
+    ;; be printed by the CLI or captured in a LaunchDaemon journal.
+    (-> (start {:config config})
+        (.then (fn [_] nil))
+        (.catch
+         (fn [error]
+           (js/console.error (str "Kekkai node runtime failed: "
+                                  (or (ex-message error) error)))
+           (set! (.-exitCode js/process) 1))))))

@@ -1,0 +1,192 @@
+(ns kekkai.node.stun-test
+  (:require [kotoba.test :refer [deftest is async]]
+            [kotoba.turn.stun :as codec]
+            [kekkai.node.stun :as stun]))
+
+(declare encode-xor-mapped-v6)
+
+(defn- scripted-socket [answers-by-host]
+  (let [handlers (atom [])]
+    #js {:on (fn [event handler]
+               (when (= event "message") (swap! handlers conj handler)))
+         :removeListener (fn [event handler]
+                           (when (= event "message")
+                             (swap! handlers
+                                    (fn [all]
+                                      (vec (remove #(identical? % handler) all))))))
+         :send (fn [buf _port host]
+                 (when-let [answer (get answers-by-host host)]
+                   (let [{:keys [ip port family]}
+                         (if (map? answer)
+                           answer
+                           {:ip (first answer) :port (second answer) :family 4})
+                         request (vec (js/Uint8Array.from buf))
+                         {:keys [txid]} (codec/decode-header request)
+                         mapped (if (= family 6)
+                                  (encode-xor-mapped-v6 ip port txid)
+                                  (codec/encode-xor-mapped-v4 ip port))
+                         response (-> (codec/encode-header
+                                       {:typ codec/binding-response :length 0 :txid txid})
+                                      (codec/push-attr codec/attr-xor-mapped-address mapped)
+                                      codec/set-attr-length)
+                         message (js/Buffer.from (clj->js response))]
+                     (doseq [handler @handlers]
+                       (handler message #js {:address "203.0.113.1" :port 3478})))))}))
+
+(defn- encode-xor-mapped-v6 [ip port txid]
+  (let [mask (into [0x21 0x12 0xa4 0x42] txid)
+        x-port (bit-xor port 0x2112)
+        x-ip (mapv bit-xor ip mask)]
+    (into [0 0x02
+           (bit-and (bit-shift-right x-port 8) 255)
+           (bit-and x-port 255)]
+          x-ip)))
+
+(deftest reflexive-sends-a-valid-binding-request-and-reads-xor-mapped-address
+  (async done
+    (let [handler (atom nil)
+          request (atom nil)
+          sock #js {:on (fn [event f]
+                         (when (= event "message") (reset! handler f)))
+                    :removeListener (fn [_event _f]
+                                      (reset! handler nil))
+                    :send (fn [buf _port _host]
+                            (reset! request (vec (js/Uint8Array.from buf)))
+                            (let [{:keys [txid]} (codec/decode-header @request)
+                                  response (-> (codec/encode-header
+                                                {:typ codec/binding-response
+                                                 :length 0 :txid txid})
+                                               (codec/push-attr codec/attr-xor-mapped-address
+                                                                (codec/encode-xor-mapped-v4
+                                                                 [198 51 100 42] 43123))
+                                               codec/set-attr-length)]
+                              (@handler (js/Buffer.from (clj->js response))
+                                        #js {:address "203.0.113.1" :port 3478}))) }]
+      (-> (stun/reflexive {:server "192.0.2.11:3478" :sock sock :timeout-ms 20})
+          (.then (fn [mapped]
+                   (let [{:keys [typ length]} (codec/decode-header @request)]
+                     (is (= "198.51.100.42:43123" mapped))
+                     (is (= codec/binding-request typ))
+                     (is (= 0 length))
+                     (is (= 20 (count @request))))
+                   (done))
+                 (fn [error]
+                   (is false (str error))
+                   (done)))))))
+
+(deftest reflexive-decodes-ipv6-xor-mapped-address
+  (async done
+    (let [handler (atom nil)
+          ip [0x20 0x01 0x0d 0xb8 0 0 0 0 0 0 0 0 0 0 0 0x42]
+          sock #js {:on (fn [event f]
+                         (when (= event "message") (reset! handler f)))
+                    :removeListener (fn [_event _f] (reset! handler nil))
+                    :send (fn [buf _port _host]
+                            (let [{:keys [txid]} (codec/decode-header
+                                                  (vec (js/Uint8Array.from buf)))
+                                  response (-> (codec/encode-header
+                                                {:typ codec/binding-response
+                                                 :length 0 :txid txid})
+                                               (codec/push-attr
+                                                codec/attr-xor-mapped-address
+                                                (encode-xor-mapped-v6 ip 50000 txid))
+                                               codec/set-attr-length)]
+                              (@handler (js/Buffer.from (clj->js response))
+                                        #js {:address "2001:db8::1" :port 3478}))) }]
+      (-> (stun/reflexive {:server "[2001:db8::1]:3478" :sock sock :timeout-ms 20})
+          (.then (fn [mapped]
+                   (is (= "[2001:db8:0:0:0:0:0:42]:50000" mapped))
+                   (done))
+                 (fn [error]
+                   (is false (str error))
+                   (done)))))))
+
+(deftest one-stun-answer-discovers-a-candidate-but-cannot-classify-nat-mapping
+  (async done
+    (-> (stun/candidates {:servers ["192.0.2.10:3478"]
+                          :sock (scripted-socket
+                                 {"::ffff:192.0.2.10" [[198 51 100 42] 43123]})
+                          :timeout-ms 20})
+        (.then (fn [result]
+                 (is (= ["198.51.100.42:43123"] (:candidates result)))
+                 (is (= 1 (:servers-answered result)))
+                 (is (nil? (:symmetric? result)))
+                 (done))
+               (fn [error]
+                 (is false (str error))
+                 (done))))))
+
+(deftest nat-mapping-classification-compares-two-stun-answers
+  (async done
+    (-> (stun/candidates {:servers ["192.0.2.10:3478" "192.0.2.20:3478"]
+                          :sock (scripted-socket
+                                 {"::ffff:192.0.2.10" [[198 51 100 42] 43123]
+                                  "::ffff:192.0.2.20" [[198 51 100 42] 43123]})
+                          :timeout-ms 20})
+        (.then (fn [result]
+                 (is (= 2 (:servers-answered result)))
+                 (is (false? (:symmetric? result)))
+                 (done))
+               (fn [error]
+                 (is false (str error))
+                 (done))))))
+
+(deftest distinct-stun-mappings-are-reported-as-symmetric
+  (async done
+    (-> (stun/candidates {:servers ["192.0.2.10:3478" "192.0.2.20:3478"]
+                          :sock (scripted-socket
+                                 {"::ffff:192.0.2.10" [[198 51 100 42] 43123]
+                                  "::ffff:192.0.2.20" [[198 51 100 42] 43124]})
+                          :timeout-ms 20})
+        (.then (fn [result]
+                 (is (= ["198.51.100.42:43123" "198.51.100.42:43124"]
+                        (:candidates result)))
+                 (is (true? (:symmetric? result)))
+                 (done))
+               (fn [error]
+                 (is false (str error))
+                 (done))))))
+
+(deftest different-ip-families-do-not-look-like-symmetric-nat
+  (async done
+    (-> (stun/candidates {:servers ["192.0.2.10:3478" "[2001:db8::10]:3478"]
+                          :sock (scripted-socket
+                                 {"::ffff:192.0.2.10"
+                                  {:ip [198 51 100 42] :port 43123 :family 4}
+                                  "2001:db8::10"
+                                  {:ip [0x20 0x01 0x0d 0xb8 0 0 0 0
+                                        0 0 0 0 0 0 0 0x42]
+                                   :port 50000 :family 6}})
+                          :timeout-ms 20})
+        (.then (fn [result]
+                 (is (= #{"198.51.100.42:43123"
+                          "[2001:db8:0:0:0:0:0:42]:50000"}
+                        (set (:candidates result))))
+                 (is (= [4 6] (:families-answered result)))
+                 (is (nil? (:symmetric? result)))
+                 (done))
+               (fn [error]
+                 (is false (str error))
+                 (done))))))
+
+(deftest hostname-stun-probes-both-ip-families
+  (async done
+    (-> (stun/candidates {:servers ["localhost:3478"]
+                          :sock (scripted-socket
+                                 {"::ffff:127.0.0.1"
+                                  {:ip [198 51 100 9] :port 43123 :family 4}
+                                  "::1"
+                                  {:ip [0x20 0x01 0x0d 0xb8 0 0 0 0
+                                        0 0 0 0 0 0 0 9]
+                                   :port 50000 :family 6}})
+                          :timeout-ms 20})
+        (.then (fn [result]
+                 (is (= [4 6] (:families-answered result)))
+                 (is (= 2 (:endpoint-answers result)))
+                 (is (= #{"198.51.100.9:43123"
+                          "[2001:db8:0:0:0:0:0:9]:50000"}
+                        (set (:candidates result))))
+                 (done))
+               (fn [error]
+                 (is false (str error))
+                 (done))))))

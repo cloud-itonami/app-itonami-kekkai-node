@@ -1,0 +1,515 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		2AC9D42DEA24975533393559 /* KekkaiTunnelHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79A430CFB65B6F0E84CED273 /* KekkaiTunnelHost.swift */; };
+		3F2C104560B039BE02B1BF16 /* PacketPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 68EA03C5FB3048D3852C8746 /* PacketPolicy.swift */; };
+		5DB746FA83006CFE5CFC3A31 /* KekkaiLocalNodeTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB7A2ECA194D949205657A63 /* KekkaiLocalNodeTransport.swift */; };
+		991FED2E9FFCC465BCBA12E8 /* KekkaiTunnelExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 0BDE8BAD35532FB40DF7EA00 /* KekkaiTunnelExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		A89CC09D871552D8B412E488 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7C131BA846F1EF02D3243078 /* NetworkExtension.framework */; };
+		CE2F8B5A88F253F7C0EA3F4D /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E7F1BE8EE371C57AB79E9C68 /* Network.framework */; };
+		CFEE06F601D3D409F01027D3 /* PacketTunnelProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E6909B40C29C909E84D61B6 /* PacketTunnelProvider.swift */; };
+		E7C3D852FAD5A8AC12C19F3A /* KekkaiTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99BD8A1AA6DC9EE92D50CECD /* KekkaiTransport.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		16B8488AD5A82EE5B5DEB803 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 97BBCF1FA46CE5E7C0E19BFF /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B96FD6EC478CB9C735607C75;
+			remoteInfo = KekkaiTunnelExtension;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		051B09DC844C44123538D08A /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				991FED2E9FFCC465BCBA12E8 /* KekkaiTunnelExtension.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		01E55279CDC849D2F53B88A1 /* KekkaiTunnelHost.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = KekkaiTunnelHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		0BDE8BAD35532FB40DF7EA00 /* KekkaiTunnelExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = KekkaiTunnelExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		24A553DCFC1AA8200860C060 /* KekkaiTunnelHost.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = KekkaiTunnelHost.entitlements; sourceTree = "<group>"; };
+		68EA03C5FB3048D3852C8746 /* PacketPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketPolicy.swift; sourceTree = "<group>"; };
+		79A430CFB65B6F0E84CED273 /* KekkaiTunnelHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KekkaiTunnelHost.swift; sourceTree = "<group>"; };
+		7C131BA846F1EF02D3243078 /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = System/Library/Frameworks/NetworkExtension.framework; sourceTree = SDKROOT; };
+		99BD8A1AA6DC9EE92D50CECD /* KekkaiTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KekkaiTransport.swift; sourceTree = "<group>"; };
+		9E6909B40C29C909E84D61B6 /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
+		CB7A2ECA194D949205657A63 /* KekkaiLocalNodeTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KekkaiLocalNodeTransport.swift; sourceTree = "<group>"; };
+		E7F1BE8EE371C57AB79E9C68 /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = System/Library/Frameworks/Network.framework; sourceTree = SDKROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		777ED3E3AB3CA748B17F125B /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				CE2F8B5A88F253F7C0EA3F4D /* Network.framework in Frameworks */,
+				A89CC09D871552D8B412E488 /* NetworkExtension.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		18A4C8544F060C802153B221 = {
+			isa = PBXGroup;
+			children = (
+				1A40B8E9666979C408A7356D /* KekkaiTunnelHost */,
+				942E11001202CD37CB1E09E6 /* Sources */,
+				A23584667C739C8EAAA473DA /* Frameworks */,
+				2868791CAE21BA50EEDF3EB3 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		1A40B8E9666979C408A7356D /* KekkaiTunnelHost */ = {
+			isa = PBXGroup;
+			children = (
+				24A553DCFC1AA8200860C060 /* KekkaiTunnelHost.entitlements */,
+				79A430CFB65B6F0E84CED273 /* KekkaiTunnelHost.swift */,
+			);
+			path = KekkaiTunnelHost;
+			sourceTree = "<group>";
+		};
+		2868791CAE21BA50EEDF3EB3 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				0BDE8BAD35532FB40DF7EA00 /* KekkaiTunnelExtension.appex */,
+				01E55279CDC849D2F53B88A1 /* KekkaiTunnelHost.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		39F1059983CABCB9A780E581 /* KekkaiTunnel */ = {
+			isa = PBXGroup;
+			children = (
+				CB7A2ECA194D949205657A63 /* KekkaiLocalNodeTransport.swift */,
+				99BD8A1AA6DC9EE92D50CECD /* KekkaiTransport.swift */,
+				68EA03C5FB3048D3852C8746 /* PacketPolicy.swift */,
+				9E6909B40C29C909E84D61B6 /* PacketTunnelProvider.swift */,
+			);
+			path = KekkaiTunnel;
+			sourceTree = "<group>";
+		};
+		942E11001202CD37CB1E09E6 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				39F1059983CABCB9A780E581 /* KekkaiTunnel */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		A23584667C739C8EAAA473DA /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				E7F1BE8EE371C57AB79E9C68 /* Network.framework */,
+				7C131BA846F1EF02D3243078 /* NetworkExtension.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A20E902B4432454130B523FC /* KekkaiTunnelHost */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FF4920EBA3AE88247E50DEA6 /* Build configuration list for PBXNativeTarget "KekkaiTunnelHost" */;
+			buildPhases = (
+				CEE1E96BA2969C1D892B44C2 /* Sources */,
+				051B09DC844C44123538D08A /* Embed Foundation Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				1A3D33E38C8879E06D23A783 /* PBXTargetDependency */,
+			);
+			name = KekkaiTunnelHost;
+			packageProductDependencies = (
+			);
+			productName = KekkaiTunnelHost;
+			productReference = 01E55279CDC849D2F53B88A1 /* KekkaiTunnelHost.app */;
+			productType = "com.apple.product-type.application";
+		};
+		B96FD6EC478CB9C735607C75 /* KekkaiTunnelExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = BC1931CD4163628EFBBCD419 /* Build configuration list for PBXNativeTarget "KekkaiTunnelExtension" */;
+			buildPhases = (
+				CB39CCC4A74FB03B6CD34610 /* Build Kotoba packet plane */,
+				957AAC33D03C757F25BA4773 /* Sources */,
+				777ED3E3AB3CA748B17F125B /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = KekkaiTunnelExtension;
+			packageProductDependencies = (
+			);
+			productName = KekkaiTunnelExtension;
+			productReference = 0BDE8BAD35532FB40DF7EA00 /* KekkaiTunnelExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		97BBCF1FA46CE5E7C0E19BFF /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					A20E902B4432454130B523FC = {
+						ProvisioningStyle = Automatic;
+					};
+					B96FD6EC478CB9C735607C75 = {
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 97CB4D2E083ED77F1B2A4B50 /* Build configuration list for PBXProject "KekkaiTunnel" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 18A4C8544F060C802153B221;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 2868791CAE21BA50EEDF3EB3 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				B96FD6EC478CB9C735607C75 /* KekkaiTunnelExtension */,
+				A20E902B4432454130B523FC /* KekkaiTunnelHost */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		CB39CCC4A74FB03B6CD34610 /* Build Kotoba packet plane */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(PROJECT_DIR)/../../kotoba/kekkai/packet_plane.kotoba",
+				"$(PROJECT_DIR)/../../platform/apple/Native/KotobaPacketPlaneBridge.c",
+			);
+			name = "Build Kotoba packet plane";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(PROJECT_DIR)/build/packet-plane-apple/libKekkaiPacketPlane.a",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"$PROJECT_DIR/../../scripts/build-apple-packet-plane.sh\" \\\n  \"$PROJECT_DIR/build/packet-plane-apple\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		957AAC33D03C757F25BA4773 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				5DB746FA83006CFE5CFC3A31 /* KekkaiLocalNodeTransport.swift in Sources */,
+				E7C3D852FAD5A8AC12C19F3A /* KekkaiTransport.swift in Sources */,
+				3F2C104560B039BE02B1BF16 /* PacketPolicy.swift in Sources */,
+				CFEE06F601D3D409F01027D3 /* PacketTunnelProvider.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		CEE1E96BA2969C1D892B44C2 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2AC9D42DEA24975533393559 /* KekkaiTunnelHost.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		1A3D33E38C8879E06D23A783 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B96FD6EC478CB9C735607C75 /* KekkaiTunnelExtension */;
+			targetProxy = 16B8488AD5A82EE5B5DEB803 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		132E93D501DB01F54DE74C83 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 0.1.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		482878C4D3731FBBB01D784E /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MARKETING_VERSION = 0.1.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		8186ACA64B18B49483FE1D3D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = KekkaiTunnelHost/KekkaiTunnelHost.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Kekkai;
+				INFOPLIST_KEY_LSUIElement = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = jp.kotoba.kekkai;
+				PRODUCT_NAME = KekkaiTunnel;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		B33B438041EF53DE9C22B565 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = KekkaiTunnel.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = KekkaiTunnelExtension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/build/packet-plane-apple",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lKekkaiPacketPlane",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = jp.kotoba.kekkai.tunnel;
+				PRODUCT_NAME = KekkaiTunnelExtension;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+			};
+			name = Debug;
+		};
+		D5D53C72B07F01EAAED2B222 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = KekkaiTunnelHost/KekkaiTunnelHost.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Kekkai;
+				INFOPLIST_KEY_LSUIElement = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = jp.kotoba.kekkai;
+				PRODUCT_NAME = KekkaiTunnel;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		F10627388D9879D41676CE4C /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = KekkaiTunnel.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = KekkaiTunnelExtension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/build/packet-plane-apple",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lKekkaiPacketPlane",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = jp.kotoba.kekkai.tunnel;
+				PRODUCT_NAME = KekkaiTunnelExtension;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		97CB4D2E083ED77F1B2A4B50 /* Build configuration list for PBXProject "KekkaiTunnel" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				132E93D501DB01F54DE74C83 /* Debug */,
+				482878C4D3731FBBB01D784E /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		BC1931CD4163628EFBBCD419 /* Build configuration list for PBXNativeTarget "KekkaiTunnelExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B33B438041EF53DE9C22B565 /* Debug */,
+				F10627388D9879D41676CE4C /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		FF4920EBA3AE88247E50DEA6 /* Build configuration list for PBXNativeTarget "KekkaiTunnelHost" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D5D53C72B07F01EAAED2B222 /* Debug */,
+				8186ACA64B18B49483FE1D3D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 97BBCF1FA46CE5E7C0E19BFF /* Project object */;
+}

@@ -1,0 +1,42 @@
+(ns kekkai.node.heartbeat-keygen
+  "Create an owner-only Ed25519 identity for signed Kekkai heartbeats.
+
+  The seed is written once to an exclusive 0600 file and is never printed;
+  only its public did:key is returned for governed node enrollment."
+  (:require [ed25519.core :as ed25519]
+            [kekkai.node.heartbeat :as heartbeat]
+            [clojure.string :as string]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]))
+
+(defn generate!
+  "Generate a random 32-byte heartbeat seed at PATH without overwriting files.
+
+  Returns {:did did:key :seed-file PATH}; the seed remains on disk with mode
+  0600 and is omitted from both the return value and process output."
+  [seed-file]
+  (when-not (and (string? seed-file) (not (string/blank? seed-file)))
+    (throw (ex-info "heartbeat keygen requires an output path"
+                    {:type :kekkai/invalid-heartbeat-keygen-path})))
+  (let [seed-hex (.toString (.randomBytes crypto 32) "hex")
+        seed (ed25519/unhex seed-hex)
+        did (ed25519/did-key-from-seed seed)
+        created? (atom false)]
+    (try
+      (.writeFileSync fs seed-file (str seed-hex "\n")
+                      #js {:encoding "utf8" :mode 384 :flag "wx"})
+      (reset! created? true)
+      (.chmodSync fs seed-file 384)
+      (let [identity (heartbeat/load-identity! {:seed-file seed-file :did did})]
+        {:did (:did identity) :seed-file seed-file})
+      (catch :default error
+        (when @created?
+          (try (.unlinkSync fs seed-file) (catch :default _ nil)))
+        (throw error)))))
+
+(defn -main [& args]
+  (let [[seed-file & more] args]
+    (when (or (nil? seed-file) (seq more))
+      (throw (ex-info "usage: kekkai.node.heartbeat-keygen OUTPUT_SEED_FILE"
+                      {:type :kekkai/invalid-cli-arguments})))
+    (println (pr-str (generate! seed-file)))))

@@ -47,3 +47,12 @@
 (deftest packet-framing-is-distinct-and-bounded
   (is (= ipv4 (:packet/bytes (packet/unframe (packet/frame ipv4)))))
   (is (nil? (packet/unframe ipv4))))
+
+(deftest inbound-packets-require-a-directed-inbound-tun-grant
+  (is (not (packet/inbound-authorized? nm "exit-a"))
+      "an outbound TUN grant must not allow unsolicited packets back in")
+  (is (packet/inbound-authorized?
+       (update nm :netmap/edges conj
+               {:edge/from "exit-a" :edge/to "client"
+                :edge/capabilities [:overlay :tun]})
+       "exit-a")))

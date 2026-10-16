@@ -13,6 +13,7 @@
   (:require [kotoba.lang.text :as str]))
 
 (def ^:const default-label "cloud.kekkai.node")
+(def ^:const default-search-path "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
 
 (defn- xml-escape [s]
   (-> (str s)
@@ -29,21 +30,38 @@
   "The LaunchDaemon plist for the agent.
 
    `:label`       job label (default `cloud.kekkai.node`)
-   `:nbb`         absolute path to the nbb executable
+   `:kbb`         absolute path to the kbb executable (loads .cljk sources)
    `:classpath`   the agent's classpath
    `:script`      absolute path to `bin/agent.cljk`
    `:config-file` absolute path to the agent's EDN config
+   `:service-user` macOS short account name (a LaunchDaemon must never run as root)
+   `:launchd-path` executable search path; launchd does not read shell profiles
    `:working-dir` where to run
    `:log-dir`     stdout/stderr destination"
-  [{:keys [label nbb classpath script config-file working-dir log-dir]
-    :or {label default-label log-dir "/var/log"}}]
-  (let [args [nbb "--classpath" classpath script config-file]]
+  [{:keys [label kbb classpath script config-file service-user launchd-path working-dir log-dir]
+    :or {label default-label
+         launchd-path default-search-path
+         log-dir "/var/log"}}]
+  (let [service-user (when (string? service-user) (str/trim service-user))
+        _ (when-not (and (seq service-user)
+                         (not (contains? #{"root" "0"} (str/lower service-user))))
+            (throw (ex-info "LaunchDaemon requires a non-root :service-user"
+                            {:type :kekkai/invalid-launchd-user})))
+        _ (when-not (and (string? launchd-path) (seq (str/trim launchd-path)))
+            (throw (ex-info "LaunchDaemon requires a non-empty :launchd-path"
+                            {:type :kekkai/invalid-launchd-path})))
+        args [kbb "--classpath" classpath script config-file]]
     (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
          "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\""
          " \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
          "<plist version=\"1.0\">\n"
          "<dict>\n"
          "  <key>Label</key>\n  <string>" (xml-escape label) "</string>\n"
+         "  <key>UserName</key>\n  <string>" (xml-escape service-user) "</string>\n"
+         "  <key>EnvironmentVariables</key>\n"
+         "  <dict>\n"
+         "    <key>PATH</key>\n    <string>" (xml-escape launchd-path) "</string>\n"
+         "  </dict>\n"
          "  <key>ProgramArguments</key>\n" (plist-array args) "\n"
          "  <key>RunAtLoad</key>\n  <true/>\n"
          "  <key>KeepAlive</key>\n  <true/>\n"

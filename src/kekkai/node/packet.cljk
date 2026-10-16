@@ -45,12 +45,42 @@
                   (= (bit-and (nth address whole) mask)
                      (bit-and (nth prefix whole) mask)))))))
 
+(defn valid-route?
+  [route]
+  (let [family (:route/family route)
+        prefix (:route/prefix route)
+        bits (:route/bits route)
+        width (case family 4 32 6 128 nil)]
+    (and (map? route)
+         width
+         (vector? prefix)
+         (= (quot width 8) (count prefix))
+         (every? #(and (int? %) (<= 0 % 255)) prefix)
+         (int? bits)
+         (<= 0 bits width))))
+
 (defn route-match?
   [packet route]
-  (and (= (:packet/family packet) (:route/family route))
+  (and (valid-route? route)
+       (= (:packet/family packet) (:route/family route))
        (prefix-match? (:packet/destination packet)
                       (vec (:route/prefix route))
                       (:route/bits route))))
+
+(defn authorized-routes
+  "Stable, validated route prefixes carried by currently authorized peers with
+  a directed :tun grant from this node. The OS tunnel installs only these
+  prefixes; an empty result must never be represented as a default route."
+  [nm now]
+  (let [self (get-in nm [:netmap/self :node/id])]
+    (->> (:netmap/peers nm)
+         (filter #(and (netmap/authorized? % now)
+                       (netmap/reachable? nm self (:node/id %) :tun)))
+         (mapcat :node/routes)
+         (filter valid-route?)
+         distinct
+         (sort-by (juxt :route/family :route/bits :route/prefix))
+         vec)))
 
 (defn route-peer
   "Longest-prefix match among authorized :tun peers. Ambiguous equal-length
@@ -72,10 +102,11 @@
 (defn inbound-authorized?
   [nm peer-id]
   (let [self (get-in nm [:netmap/self :node/id])]
-    (or (netmap/reachable? nm peer-id self :tun)
-        ;; Response traffic on an outbound edge is allowed, but this does not
-        ;; grant the peer authority to originate an unrelated session.
-        (netmap/reachable? nm self peer-id :tun))))
+    ;; The packet bridge has no connection tracker, so it cannot distinguish a
+    ;; reply from a peer-originated flow. Require explicit inbound authority;
+    ;; allowing the outbound edge here would let that peer inject arbitrary IP
+    ;; packets over the overlay.
+    (netmap/reachable? nm peer-id self :tun)))
 
 (defn frame [packet-bytes]
   (into magic packet-bytes))

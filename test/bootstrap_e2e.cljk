@@ -1,0 +1,414 @@
+#!/usr/bin/env kbb
+;; Cold-start two real Kekkai agents from signed endpoint netmaps with no relay.
+;; Both nodes must complete Noise IK and select their direct UDP candidate.
+;;
+;;   scripts/test-bootstrap-ssh-e2e.sh
+(ns bootstrap-e2e
+  (:require [kotoba.bytes :as b]
+            [kekkai.node.agent :as agent]
+            [kekkai.node.stream-edge :as stream-edge]
+            [kekkai.node.udp :as udp]
+            [noise.core :as noise]
+            [noise.provider.node :as provider]
+            [kotoba.lang.text :as str]
+            ["node:child_process" :as cp]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:net" :as net]
+            ["node:path" :as path]))
+
+(def suite (noise/suite (provider/ports)))
+(def failures (atom []))
+(def active (atom []))
+(def observed (atom []))
+(def resources (atom []))
+(def direct-ready? (atom false))
+(def root (aget (.-env js/process) "KEKKAI_BOOTSTRAP_E2E_DIR"))
+(def murakumo-root "/Users/junkawasaki/github/wt/codex/murakumo-kekkai-integration/murakumo")
+
+(defn check [ok? label & [detail]]
+  (if ok?
+    (println (str "  ok   " label))
+    (do (println (str "  FAIL " label (when detail (str " — " (pr-str detail)))))
+        (swap! failures conj label)))
+  ok?)
+
+(defn sleep [ms]
+  (js/Promise. (fn [resolve _] (js/setTimeout resolve ms))))
+
+(defn wait-for [predicate timeout-ms]
+  (js/Promise.
+   (fn [resolve _]
+     (let [deadline (+ (.getTime (js/Date.)) timeout-ms)]
+       (letfn [(poll []
+                 (cond
+                   (predicate) (resolve true)
+                   (>= (.getTime (js/Date.)) deadline) (resolve false)
+                   :else (js/setTimeout poll 50)))]
+         (poll))))))
+
+(defn free-port []
+  (js/Promise.
+   (fn [resolve reject]
+     (-> (udp/socket {:port 0 :host "127.0.0.1"})
+         (.then (fn [sock]
+                  (let [port (udp/local-port sock)]
+                    (.once sock "close" #(resolve port))
+                    (udp/close! sock))))
+         (.catch reject)))))
+
+(defn echo-server []
+  (js/Promise.
+   (fn [resolve reject]
+     (let [server (.createServer net #(.pipe % %))]
+       (.once server "error" reject)
+       (.listen server 0 "127.0.0.1"
+                #(resolve [server (.-port (.address server))]))))))
+
+(defn listening-port [server]
+  (js/Promise.
+   (fn [resolve _]
+     (if-let [address (.address server)]
+       (resolve (.-port address))
+       (.once server "listening" #(resolve (.-port (.address server))))))))
+
+(defn tcp-exchange [port payload]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [got (atom [])
+           done? (atom false)
+           socket (.connect net #js {:port port :host "127.0.0.1"})
+           finish (fn []
+                    (when (compare-and-set! done? false true)
+                      (.destroy socket)
+                      (resolve @got)))]
+       (.once socket "connect"
+              #(.write socket (.from js/Buffer (clj->js payload))))
+       (.on socket "data"
+            (fn [chunk]
+              (swap! got into (vec (js/Uint8Array. chunk)))
+              (when (>= (count @got) (count payload)) (finish))))
+       (.once socket "error" reject)
+       (js/setTimeout finish 5000)))))
+
+(defn keypair []
+  (let [kp (noise/keypair suite)]
+    {:priv (b/hex (:priv kp)) :pub (b/hex (:pub kp))}))
+
+(defn authority []
+  (let [kp (.generateKeyPairSync crypto "ed25519")]
+    {:private (.-privateKey kp)
+     :spki (.toString (.export (.-publicKey kp)
+                              #js {:format "der" :type "spki"})
+                      "base64")}))
+
+(defn signed-text [{:keys [private spki]} value]
+  (let [payload (binding [*print-namespace-maps* false
+                          *print-length* nil
+                          *print-level* nil]
+                  (pr-str value))
+        bytes (.from js/Buffer payload "utf8")
+        signature (.sign crypto nil bytes private)
+        digest (-> (.createHash crypto "sha256")
+                   (.update bytes)
+                   (.digest "hex"))]
+    (binding [*print-namespace-maps* false
+              *print-length* nil
+              *print-level* nil]
+      (pr-str {:netmap/payload-b64 (.toString bytes "base64")
+               :netmap/signature-b64 (.toString signature "base64")
+               :netmap/signer-spki-b64 spki
+               :netmap/sha256 digest}))))
+
+(defn netmap-for [self-id peer-id self-key peer-key endpoint service-ports]
+  {:netmap/version 1
+   :netmap/tailnet "bootstrap-e2e.test"
+   :netmap/self {:node/id self-id :node/key (:pub self-key)}
+   :netmap/peers [{:node/id peer-id :node/key (:pub peer-key)
+                   :node/status "authorized"
+                   :node/endpoints [endpoint]}]
+   :netmap/edges [{:edge/from "asher" :edge/to "judah"
+                   :edge/capabilities [:overlay :ssh]
+                   :edge/ports service-ports}]
+   :netmap/relays []})
+
+(defn write-netmap! [name authority value]
+  (let [file (.join path root name)]
+    (.writeFileSync fs file (signed-text authority value) #js {:mode 384})
+    file))
+
+(defn config [node-id kp netmap-file port authority]
+  {:node/id node-id
+   :static kp
+   :netmap-file netmap-file
+   :netmap-authority-spki-b64 (:spki authority)
+   :listen-host "127.0.0.1"
+   :listen-port port
+   :tick-ms 50
+   :netmap-poll-ms 50
+   :dns {:enabled? false}
+   :stun-servers []})
+
+(defn peer-status [handle]
+  (first (:peers ((:status handle)))))
+
+(defn start-node-with-stream [config forwards]
+  (let [registry (atom {})
+        handle-ref (atom nil)
+        callback (stream-edge/event-handler
+                  registry handle-ref #(swap! observed conj %))]
+    (-> (agent/start {:config config :on-event callback})
+        (.then
+         (fn [handle]
+           (reset! handle-ref handle)
+           (-> (stream-edge/attach handle {:forwards forwards} registry)
+               (.then (fn [component]
+                        (assoc handle
+                               :stream-registry registry
+                               :stream-stop (:stop component)
+                               :forwarders (:forwarders component))))))))))
+
+(defn ssh-through [port user ssh-key]
+  (js/Promise.
+   (fn [resolve _]
+     (let [args #js ["-p" (str port)
+                     "-i" ssh-key
+                     "-o" "IdentitiesOnly=yes"
+                     "-o" "StrictHostKeyChecking=no"
+                     "-o" "UserKnownHostsFile=/dev/null"
+                     "-o" "BatchMode=yes"
+                     "-o" "ConnectTimeout=10"
+                     (str user "@127.0.0.1")
+                     "printf KEKKAI_SSH_DIRECT_OK"]
+           child (.spawn cp "ssh" args)
+           out (atom "")
+           err (atom "")]
+       (.on (.-stdout child) "data" #(swap! out str (.toString %)))
+       (.on (.-stderr child) "data" #(swap! err str (.toString %)))
+       (.on child "close" (fn [code] (resolve {:code code :out @out :err @err})))
+       (.on child "error" (fn [e] (resolve {:code -1 :out @out :err (str e)})))))))
+
+(defn murakumo-task-through [ssh-port user ssh-key]
+  (js/Promise.
+   (fn [resolve _]
+     (let [bin-dir (.join path root "bin")
+           ssh-config (.join path root "ssh_config")
+           wrapper (.join path bin-dir "ssh")
+           fleet-file (.join path root "murakumo-fleet.edn")
+           ledger-file (.join path root "murakumo-task-ledger.edn")
+           admission-ledger (.join path root "no-kekkai-admission-ledger.edn")
+           _ (.mkdirSync fs bin-dir #js {:recursive true})
+           _ (.writeFileSync fs ssh-config
+                             (str "Host 127.0.0.1\n"
+                                  "  User " user "\n"
+                                  "  IdentityFile " ssh-key "\n"
+                                  "  IdentitiesOnly yes\n"
+                                  "  StrictHostKeyChecking no\n"
+                                  "  UserKnownHostsFile /dev/null\n"))
+           _ (.writeFileSync fs wrapper
+                             (str "#!/bin/sh\nexec /usr/bin/ssh -F \""
+                                  ssh-config "\" \"$@\"\n"))
+           _ (.chmodSync fs wrapper 448)
+           _ (.writeFileSync fs fleet-file
+                             (pr-str {:fleet/port 8077
+                                      :nodes [{:name "judah" :host "127.0.0.1"
+                                               :roles ["compute"] :slots 1 :cores 1
+                                               :mem-bytes 4294967296
+                                               :kekkai {:node-id "judah"
+                                                        :ssh-user user
+                                                        :ssh-local-port ssh-port}}]}))
+           env (js/Object.assign #js {} (.-env js/process))
+           old-path (or (aget env "PATH") "")
+           _ (aset env "PATH" (str bin-dir (.-delimiter path) old-path))
+           _ (aset env "MURAKUMO_KEKKAI_LEDGER" admission-ledger)
+           argv #js ["--backend" "sci" "src/murakumo/task.cljk" "run"
+                     "--fleet" fleet-file "--ledger" ledger-file
+                     "--transport" "kekkai" "--nodes" "judah"
+                     "--no-probe" "--no-multiplex" "--no-worker"
+                     "--n" "1" "--attempts" "1"
+                     "--cmd" "printf MURAKUMO_KEKKAI_DIRECT_OK"
+                     "--format" "edn"]
+           child (.spawn cp "kbb" argv #js {:cwd murakumo-root :env env})
+           out (atom "")
+           err (atom "")]
+       (.on (.-stdout child) "data" #(swap! out str (.toString %)))
+       (.on (.-stderr child) "data" #(swap! err str (.toString %)))
+       (.on child "close" (fn [code] (resolve {:code code :out @out :err @err})))
+       (.on child "error" (fn [e] (resolve {:code -1 :out @out :err (str e)})))))))
+
+(defn stream-summaries [handle]
+  (mapv (fn [[key entry]]
+          [key (let [state (:stream entry)]
+                 {:role (:role state)
+                  :phase (:phase state)
+                  :send-next (:send-next state)
+                  :send-una (:send-una state)
+                  :recv-next (:recv-next state)
+                  :pending-count (count (:pending state))
+                  :unacked-count (count (:unacked state))})])
+        (filter (fn [[key _]] (vector? key)) @(:stream-registry handle))))
+
+(defn run-ssh-checks! [asher-handle user ssh-key]
+  (let [ssh-forward (second (:forwarders asher-handle))]
+    (-> (listening-port ssh-forward)
+        (.then (fn [port]
+                 (println (str "  OpenSSH forward on 127.0.0.1:" port))
+                 (-> (ssh-through port user ssh-key)
+                     (.then (fn [ssh-result]
+                              (let [ssh-ok? (and (= 0 (:code ssh-result))
+                                                 (str/includes? (:out ssh-result)
+                                                                "KEKKAI_SSH_DIRECT_OK"))]
+                                (when-not ssh-ok?
+                                  (doseq [[node handle] (map vector ["asher" "judah"] @active)]
+                                    (println (str "  stream state " node " "
+                                                  (pr-str (stream-summaries handle)))))
+                                  (println (str "  recent events "
+                                                (pr-str (take-last 20 @observed)))))
+                                (check ssh-ok?
+                                       "real OpenSSH command completed over the relay-free direct path"
+                                       (select-keys ssh-result [:code :out :err]))
+                                (check (= 2 (get-in @(:stream-registry asher-handle)
+                                                    [stream-edge/stream-sequences-key "judah"]))
+                                       "separate forwards reserve distinct per-peer stream IDs")
+                                (if ssh-ok?
+                                  (do (println "  running Murakumo CLI through the same direct Kekkai forward")
+                                      (murakumo-task-through port user ssh-key))
+                                  nil)))))))
+        (.then (fn [murakumo-result]
+                 (when murakumo-result
+                   (let [murakumo-ok? (and (= 0 (:code murakumo-result))
+                                           (str/includes? (:out murakumo-result)
+                                                          "MURAKUMO_KEKKAI_DIRECT_OK"))]
+                     (check murakumo-ok?
+                            "Murakumo CLI task completed SSH over the relay-free direct path"
+                            (select-keys murakumo-result [:code :out :err]))
+                     (check (= 3 (get-in @(:stream-registry asher-handle)
+                                         [stream-edge/stream-sequences-key "judah"]))
+                            "Murakumo's connection gets a fresh stream ID on the same forward"))))))))
+
+(defn- cleanup []
+  (doseq [handle @active]
+    (try
+      (when-let [stop-stream (:stream-stop handle)] (stop-stream))
+      ((:stop handle))
+      (catch :default _ nil)))
+  (reset! active [])
+  (doseq [resource @resources]
+    (try (.close resource) (catch :default _ nil)))
+  (reset! resources [])
+  (when (.existsSync fs root)
+    (.rmSync fs root #js {:recursive true :force true})))
+
+(defn start-relayfree-peers! [ssh-service-port]
+  (let [asher (keypair)
+        judah (keypair)
+        authority (authority)]
+    (-> (js/Promise.all #js [(free-port) (free-port) (echo-server)])
+        (.then
+         (fn [items]
+           (let [asher-port (aget items 0)
+                 judah-port (aget items 1)
+                 [echo service-port] (aget items 2)
+                 service-ports [service-port ssh-service-port]
+                 _ (swap! resources conj echo)
+                 asher-map (netmap-for "asher" "judah" asher judah
+                                       {:kind :local :host "127.0.0.1"
+                                        :port judah-port} service-ports)
+                 judah-map (netmap-for "judah" "asher" judah asher
+                                       {:kind :local :host "127.0.0.1"
+                                        :port asher-port} service-ports)
+                 asher-config (config "asher" asher
+                                      (write-netmap! "asher.edn" authority asher-map)
+                                      asher-port authority)
+                 judah-config (config "judah" judah
+                                      (write-netmap! "judah.edn" authority judah-map)
+                                      judah-port authority)]
+             (println "Starting two agents with signed endpoints, zero relays, and localhost sshd")
+             (-> (start-node-with-stream
+                  asher-config
+                  [{:listen-port 0 :peer "judah" :port service-port
+                    :capability :ssh}
+                   {:listen-port 0 :peer "judah" :port ssh-service-port
+                    :capability :ssh}])
+                 (.then (fn [handle]
+                          (swap! active conj handle)
+                          (start-node-with-stream judah-config [])))
+                 (.then
+                  (fn [handle]
+                    (swap! active conj handle)
+                    (let [asher-handle (first @active)]
+                      (check (and (nil? (:relay ((:status asher-handle))))
+                                  (nil? (:relay ((:status handle)))))
+                             "neither agent has a relay session")
+                      (-> (wait-for
+                           #(every? (fn [h]
+                                      (let [p (peer-status h)]
+                                        (and (:established? p)
+                                             (= :direct (:route p))
+                                             (= :direct (get-in p [:report :via]))
+                                             (= 1 (get-in p [:report :live-direct])))))
+                                    @active)
+                           10000)
+                          (.then
+                           (fn [connected?]
+                             (reset! direct-ready? connected?)
+                             (let [snapshots (mapv peer-status @active)]
+                               (check connected?
+                                      "both Noise sessions established over direct UDP"
+                                      snapshots)
+                               (doseq [[node snapshot]
+                                       (map vector ["asher" "judah"] snapshots)]
+                                 (println (str "  status " node " "
+                                               (pr-str (select-keys snapshot
+                                                                    [:established? :route :report])))))
+                               (if-not connected?
+                                 (do (println (str "  events "
+                                                   (pr-str (take-last 24 @observed))))
+                                     nil)
+                                 (let [forwarder (first (:forwarders asher-handle))
+                                       payload (b/utf8-encode "direct-kekkai-stream")]
+                                   (-> (listening-port forwarder)
+                                       (.then (fn [port]
+                                                (println (str "  echo forward on 127.0.0.1:" port))
+                                                (tcp-exchange port payload)))
+                                       (.then (fn [received]
+                                                (check (= payload received)
+                                                       "TCP echo bytes crossed the direct Kekkai stream"
+                                                       {:received (count received)}))))))))))))))))))
+    ))
+
+(defn -main []
+  (let [env (.-env js/process)
+        ssh-user (aget env "USER")
+        ssh-key (aget env "KEKKAI_BOOTSTRAP_SSH_KEY")
+        ssh-service-port (js/parseInt (aget env "KEKKAI_BOOTSTRAP_SSH_PORT") 10)]
+    (when-not (and (string? root) (seq root)
+                   (string? ssh-user) (seq ssh-user)
+                   (string? ssh-key) (seq ssh-key)
+                   (number? ssh-service-port) (<= 1 ssh-service-port 65535))
+      (throw (js/Error. "set the temporary E2E directory, SSH user, SSH key, and SSH port")))
+    (.mkdirSync fs root #js {:recursive true})
+    (-> (start-relayfree-peers! ssh-service-port)
+        (.then
+         (fn [_]
+           (if @direct-ready?
+             (run-ssh-checks! (first @active) ssh-user ssh-key)
+             (js/Promise.resolve nil))))
+        (.then (fn [_] (sleep 250)))
+        (.then
+         (fn [_]
+           (cleanup)
+           (if (seq @failures)
+             (do (println (str "BOOTSTRAP E2E FAILED: " (str/join ", " @failures)))
+                 (set! (.-exitCode js/process) 1))
+             (println "BOOTSTRAP E2E PASSED"))
+           (js/setTimeout #(.exit js/process (if (seq @failures) 1 0)) 50)))
+        (.catch
+         (fn [error]
+           (println (str "BOOTSTRAP E2E ERROR: " error "\n" (.-stack error)))
+           (cleanup)
+           (set! (.-exitCode js/process) 1)
+           (js/setTimeout #(.exit js/process 1) 50))))))
+
+(when (= "1" (aget (.-env js/process) "KEKKAI_BOOTSTRAP_E2E"))
+  (-main))

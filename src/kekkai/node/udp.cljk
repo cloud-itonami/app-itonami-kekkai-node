@@ -8,12 +8,107 @@
   and buys one implementation of the protocol instead of two."
   (:require [kotoba.lang.text :as str]
             ["node:dgram" :as dgram]
-            ["node:os" :as os]))
+            ["node:os" :as os]
+            ["node:net" :as net]
+            ["node:dns/promises" :as dns]))
+
+(def ^:private underlay-guards (js/WeakMap.))
 
 (defn ->vec [buf] (vec (js/Uint8Array.from buf)))
 (defn ->buf [bytes] (js/Buffer.from (js/Uint8Array.from (clj->js (vec bytes)))))
 
-(defn addr->str [rinfo] (str (.-address rinfo) ":" (.-port rinfo)))
+(declare parse-addr resolve-host-addresses)
+
+(defn- socket-host [host]
+  ;; A dual-stack udp6 socket accepts IPv4 destinations in mapped form. Node's
+  ;; send() rejects a plain IPv4 literal when the socket family is udp6.
+  (if (= 4 (.isIP net host)) (str "::ffff:" host) host))
+
+(defn- normalize-mapped-v4 [host]
+  (when (str/starts-with? (str/lower host) "::ffff:")
+    (let [tail (subs host 7)]
+      (if (str/includes? tail ".")
+        tail
+        (let [parts (str/split tail #":")]
+          (when (= 2 (count parts))
+            (let [hi (js/parseInt (nth parts 0) 16)
+                  lo (js/parseInt (nth parts 1) 16)]
+              (str (bit-shift-right hi 8) "." (bit-and hi 255) "."
+                   (bit-shift-right lo 8) "." (bit-and lo 255)))))))))
+
+(defn- send-addresses! [sock buffer port addresses]
+  (letfn [(attempt [remaining last-error]
+            (if-let [address (first remaining)]
+              (try
+                (.send sock buffer port (socket-host address)
+                       (fn [error]
+                         (when error
+                           (attempt (rest remaining) error))))
+                (catch :default error
+                  (attempt (rest remaining) error)))
+              (when last-error
+                (.emit sock "error" last-error))))]
+    (attempt (seq addresses) nil)))
+
+(defn- send-addresses-all! [sock buffer port addresses]
+  (when (seq addresses)
+    (let [remaining (atom (count addresses))
+          succeeded (atom false)
+          errors (atom [])
+          finish (fn [error]
+                   (if error
+                     (swap! errors conj error)
+                     (reset! succeeded true))
+                   (when (zero? (swap! remaining dec))
+                     (when (and (not @succeeded) (seq @errors))
+                       (.emit sock "error" (last @errors)))))]
+      (doseq [address addresses]
+        (try
+          (.send sock buffer port (socket-host address) finish)
+          (catch :default error
+            (finish error)))))))
+
+(defn- send-now! [sock bytes addr guard]
+  (let [[host port] (parse-addr addr)
+        addresses (or (seq (get @(:resolved guard) host)) [host])]
+    (send-addresses! sock (->buf bytes) port addresses)))
+
+(defn- queue-pending! [guard bytes addr]
+  (when (< (count @(:pending guard)) 4096)
+    (swap! (:pending guard) conj {:bytes (vec bytes) :addr addr})))
+
+(defn- queue-pending-family! [guard bytes addr family]
+  (when (< (count @(:pending guard)) 4096)
+    (swap! (:pending guard) conj {:bytes (vec bytes) :addr addr :family family})))
+
+(defn- send-resolved! [sock bytes addr host port]
+  (let [buffer (->buf bytes)]
+    (if (pos? (.isIP net host))
+      (send-addresses! sock buffer port [host])
+      (-> (.lookup dns host #js {:all true :verbatim true})
+          (.then (fn [records]
+                   (let [addresses (vec (distinct (map #(.-address %)
+                                                       (array-seq records))))]
+                     (when-not (seq addresses)
+                       (throw (js/Error. (str "no IP addresses for UDP host " host))))
+                     (if-let [guard (.get underlay-guards sock)]
+                       (if (contains? @(:allowed guard) host)
+                         (send-addresses! sock buffer port
+                                          (or (seq (get @(:resolved guard) host))
+                                              addresses))
+                         (queue-pending! guard bytes addr))
+                       (send-addresses! sock buffer port addresses)))))
+          (.catch (fn [error]
+                    ;; Match dgram's own asynchronous send failures: surface them
+                    ;; on the socket error channel rather than inventing a result.
+                    (.emit sock "error" error)))))))
+
+(defn addr->str [rinfo]
+  (let [raw (.-address rinfo)
+        host (or (normalize-mapped-v4 raw) raw)]
+    (if (= 6 (.isIP net host))
+      (str "[" host "]:" (.-port rinfo))
+      (str host ":" (.-port rinfo)))))
 
 (defn parse-addr
   "\"host:port\" -> [host port]; IPv6 in brackets."
@@ -24,20 +119,38 @@
     (let [idx (str/last-index-of s ":")]
       [(subs s 0 idx) (js/parseInt (subs s (inc idx)))])))
 
+(defn resolve-host-addresses
+  "Resolve an IP literal or hostname to distinct IPv4 and IPv6 addresses."
+  [host]
+  (if (pos? (.isIP net host))
+    (js/Promise.resolve [host])
+    (-> (.lookup dns host #js {:all true :verbatim true})
+        (.then (fn [records]
+                 (let [addresses (vec (distinct (map #(.-address %)
+                                                     (array-seq records))))]
+                   (when-not (seq addresses)
+                     (throw (js/Error. (str "no IP addresses for UDP host " host))))
+                   addresses))))))
+
 (defn socket
-  "Create and bind a UDP socket. `on-message` gets [byte-vector from-addr-string].
-   Returns a promise of the socket."
+  "Create and bind one dual-stack UDP socket. `on-message` gets
+   [byte-vector from-addr-string]. Returns a promise of the socket."
   [{:keys [port host on-message on-error]}]
   (js/Promise.
    (fn [resolve reject]
-     (let [sock (.createSocket dgram "udp4")]
+     (let [sock (.createSocket dgram #js {:type "udp6" :ipv6Only false})
+           bind-host (cond
+                       (nil? host) "::"
+                       (= host "0.0.0.0") "::"
+                       (= 4 (.isIP net host)) (socket-host host)
+                       :else host)]
        (.on sock "message" (fn [msg rinfo]
                              (when on-message
                                (on-message (->vec msg) (addr->str rinfo)))))
        (.on sock "error" (fn [err]
                            (if on-error (on-error err) (js/console.error err))
                            (reject err)))
-       (.bind sock (or port 0) (or host "0.0.0.0")
+       (.bind sock (or port 0) bind-host
               (fn [] (resolve sock)))))))
 
 (defn send!
@@ -45,22 +158,100 @@
    the same place the OS reports them; there is no per-datagram delivery promise
    to await and pretending otherwise would be a lie in the type."
   [sock bytes addr]
-  (let [[host port] (parse-addr addr)]
-    (.send sock (->buf bytes) port host)))
+  (let [[host port] (parse-addr addr)
+        guard (.get underlay-guards sock)]
+    (if (and guard (not (contains? @(:allowed guard) host)))
+      (queue-pending! guard bytes addr)
+      (if guard
+        (send-now! sock bytes addr guard)
+        (send-resolved! sock bytes addr host port)))))
+
+(defn send-family!
+  "Send one UDP datagram to every resolved address for the requested IP family.
+   The original hostname remains the underlay-guard key so tunnel route
+   acknowledgements still gate DNS-derived destinations."
+  [sock bytes addr family]
+  (let [[host port] (parse-addr addr)
+        guard (.get underlay-guards sock)]
+    (if guard
+      (if (contains? @(:allowed guard) host)
+        (let [addresses (or (seq (get @(:resolved guard) host)) [host])
+              selected (filterv #(= family (.isIP net %)) addresses)]
+          (send-addresses-all! sock (->buf bytes) port selected))
+        (queue-pending-family! guard bytes addr family))
+      (-> (resolve-host-addresses host)
+          (.then (fn [addresses]
+                   (send-addresses-all!
+                    sock (->buf bytes) port
+                    (filterv #(= family (.isIP net %)) addresses))))
+          (.catch (fn [error]
+                    (.emit sock "error" error)))))))
+
+(defn guard-underlay!
+  "Queue outbound datagrams until their destination host is covered by an OS
+  underlay exclusion acknowledged by the packet-tunnel provider. The queue is
+  bounded because this is a route-safety gate, not a retry store."
+  [sock]
+  (let [guard {:allowed (atom #{}) :resolved (atom {}) :pending (atom [])}]
+    (.set underlay-guards sock guard)
+    guard))
+
+(defn clear-underlay-guard!
+  "Release a previously installed provider guard after the OS removed its
+  tunnel routes. Pending datagrams are discarded; regular protocol timers retry."
+  [sock]
+  (when-let [guard (.get underlay-guards sock)]
+    (.delete underlay-guards sock)
+    (reset! (:pending guard) [])))
+
+(defn allow-underlay-hosts!
+  "Mark hosts whose resolved addresses have been installed as excluded routes,
+  then release their queued datagrams in original order."
+  [sock hosts resolved]
+  (when-let [guard (.get underlay-guards sock)]
+    (let [allowed (set hosts)
+          pending @(:pending guard)
+          ready (filter #(contains? allowed (first (parse-addr (:addr %))))
+                        pending)
+          blocked (remove #(contains? allowed (first (parse-addr (:addr %))))
+                          pending)]
+      (reset! (:allowed guard) allowed)
+      (reset! (:resolved guard) resolved)
+      (reset! (:pending guard) (vec blocked))
+      (doseq [{:keys [bytes addr family]} ready]
+        (if family
+          (let [[host port] (parse-addr addr)
+                addresses (or (seq (get @(:resolved guard) host)) [host])
+                selected (filterv #(= family (.isIP net %)) addresses)]
+            (send-addresses-all! sock (->buf bytes) port selected))
+          (send-now! sock bytes addr guard))))))
 
 (defn local-port [sock] (.-port (.address sock)))
 
 (defn close! [sock] (.close sock))
 
 (defn local-candidates
-  "Non-loopback IPv4 addresses of this host, as `host:port` strings for the given
-   local port. These are the `:local` candidates — worthless across the internet,
-   decisive on the same LAN."
+  "Non-loopback IPv4 and usable IPv6 addresses of this host, formatted as
+   `host:port` or `[ipv6]:port`. These are local candidates — worthless across
+   the internet, decisive on the same LAN."
   [port & {:keys [include-loopback?]}]
   (let [ifaces (js->clj (.networkInterfaces os) :keywordize-keys true)]
-    (into []
-          (for [[_ addrs] ifaces
-                a addrs
-                :when (and (= "IPv4" (:family a))
-                           (or include-loopback? (not (:internal a))))]
-            (str (:address a) ":" port)))))
+    (->> (for [[_ addrs] ifaces
+               a addrs
+               :let [address (:address a)
+                     family (:family a)
+                     ipv6? (= "IPv6" family)
+                     lower (str/lower address)
+                     usable-v6? (and ipv6?
+                                     (not= lower "::")
+                                     (or include-loopback? (not= lower "::1"))
+                                     (not (str/starts-with? lower "fe80:"))
+                                     (not (str/starts-with? lower "ff")))
+                     usable-v4? (and (= "IPv4" family)
+                                     (or include-loopback? (not (:internal a))))]
+               :when (or usable-v4? usable-v6?)]
+           (if ipv6?
+             (str "[" address "]:" port)
+             (str address ":" port)))
+         distinct
+         vec)))

@@ -1,6 +1,7 @@
 .cpcache/
 .nrepl-port
 *.jar
+!platform/android/gradle/wrapper/gradle-wrapper.jar
 target/
 .clj-kondo/.cache/
 node_modules/

@@ -11,15 +11,16 @@
 ;; unchanged. Neither test substitutes for the other — a correct protocol
 ;; wired to the wrong socket is still a broken forwarder.
 ;;
-;; The service here is a plain TCP echo/bulk server rather than sshd, so the
-;; test runs anywhere. `--ssh` additionally drives a real `ssh` client through
-;; the forwarder when a reachable sshd is named, which is the claim that
-;; actually matters and is reported separately rather than folded in.
+;; The service here is a plain TCP echo/bulk server, so the test runs anywhere.
+;; `--ssh <user@port> --ssh-key <private-key>` additionally reaches a peer's
+;; loopback sshd. `--murakumo-root <repo>` also runs Murakumo's task CLI through
+;; that same Kekkai forward.
 (ns stream-e2e
   (:require [kotoba.lang.text :as str]
-            [kekkai.node.agent :as agent]
             [kekkai.node.netmap :as netmap]
+            [kekkai.node.packet :as packet]
             [kekkai.node.relay-server :as relay-server]
+            [kekkai.node.runtime :as runtime]
             [kekkai.node.stream :as stream]
             [kekkai.node.stream-edge :as edge]
             [kekkai.node.udp :as udp]
@@ -27,13 +28,19 @@
             [noise.core :as noise]
             [noise.provider.node :as provider]
             ["node:child_process" :as cp]
+            ["node:crypto" :as crypto]
             ["node:fs" :as fs]
             ["node:net" :as net]
             ["node:os" :as os]
             ["node:path" :as path]))
 
 (def suite (noise/suite (provider/ports)))
+(def ipv4-packet [0x45 0 0 20 0 0 0 0 64 6 0 0 10 0 0 1 203 0 113 9])
+(def ipv6-packet [0x60 0 0 0 0 0 59 64
+                  0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1
+                  0x20 1 0x0d 0xb8 0 0 0 0 0 0 0 0 0 0 0 1])
 (def failures (atom []))
+(def observed-events (atom []))
 
 (defn check [ok? label & [detail]]
   (if ok?
@@ -68,17 +75,24 @@
   asymmetry is what makes the two refusal checks meaningful rather than
   vacuous: judah could not open an ssh stream back even though its session is
   perfectly good."
-  [self-id peer-id self-key peer-key relay-key relay-port service-port]
+  [self-id peer-id self-key peer-key relay-records service-ports]
   {:netmap/version 1
    :netmap/tailnet "kekkai.test"
    :netmap/self {:node/id self-id :node/key (:pub self-key)
                  :node/overlay-ip (if (= "asher" self-id) "100.64.0.1" "100.64.0.2")}
-   :netmap/peers [{:node/id peer-id :node/key (:pub peer-key)
-                   :node/overlay-ip (if (= "asher" peer-id) "100.64.0.1" "100.64.0.2")
-                   :node/status "authorized"}]
+   :netmap/peers [(cond-> {:node/id peer-id :node/key (:pub peer-key)
+                           :node/overlay-ip (if (= "asher" peer-id)
+                                              "100.64.0.1" "100.64.0.2")
+                           :node/status "authorized"}
+                    (= "judah" peer-id)
+                    (assoc :node/routes
+                           [{:route/family 4 :route/prefix [0 0 0 0]
+                             :route/bits 0}
+                            {:route/family 6 :route/prefix (vec (repeat 16 0))
+                             :route/bits 0}]))]
    :netmap/edges [{:edge/from "asher" :edge/to "judah"
-                   :edge/capabilities [:overlay :ssh]
-                   :edge/ports [service-port]}
+                   :edge/capabilities [:overlay :ssh :tun]
+                   :edge/ports service-ports}
                   {:edge/from "judah" :edge/to "asher"
                    :edge/capabilities [:overlay]}
                   ;; A kekkai funnel grant on the SAME port, as its own entry
@@ -86,10 +100,8 @@
                   ;; raw stream — see the :funnel check below.
                   {:edge/from "asher" :edge/to "judah"
                    :edge/capabilities [:funnel]
-                   :edge/ports [service-port]}]
-   :netmap/relays [{:relay/name "test-1" :relay/region "test"
-                    :relay/host "127.0.0.1" :relay/port relay-port
-                    :relay/key (:pub relay-key)}]})
+                   :edge/ports [(first service-ports)]}]
+   :netmap/relays relay-records})
 
 (defn- listening
   "-> Promise of the bound port. `net.Server.listen` is asynchronous, so
@@ -106,6 +118,81 @@
   (let [p (.join path dir name)]
     (.writeFileSync fs p (pr-str data))
     p))
+
+(defn- signing-authority []
+  (let [pair (.generateKeyPairSync crypto "ed25519")
+        public-key (.-publicKey pair)]
+    {:private (.-privateKey pair)
+     :spki (.toString
+            (.export public-key #js {:format "der" :type "spki"})
+            "base64")}))
+
+(defn- write-signed-netmap! [dir name authority data]
+  (let [payload (pr-str data)
+        bytes (.from js/Buffer payload "utf8")
+        signature (.sign crypto nil bytes (:private authority))
+        digest (-> (.createHash crypto "sha256")
+                   (.update bytes) (.digest "hex"))
+        envelope (pr-str {:netmap/payload-b64 (.toString bytes "base64")
+                          :netmap/signature-b64 (.toString signature "base64")
+                          :netmap/signer-spki-b64 (:spki authority)
+                          :netmap/sha256 digest})
+        p (.join path dir name)]
+    (.writeFileSync fs p envelope)
+    p))
+
+(defn- arg-value [args flag]
+  (second (drop-while #(not= flag %) args)))
+
+(defn- murakumo-task-through
+  "Run Murakumo's real task CLI against this E2E's Kekkai SSH forward."
+  [dir murakumo-root ssh-port ssh-user ssh-key]
+  (js/Promise.
+   (fn [resolve _]
+     (let [bin-dir (.join path dir "bin")
+           ssh-config (.join path dir "ssh_config")
+           wrapper (.join path bin-dir "ssh")
+           fleet-file (write-edn!
+                       dir "murakumo-fleet.edn"
+                       {:fleet/port 8077
+                        :nodes [{:name "judah" :host "127.0.0.1"
+                                 :roles ["compute"] :slots 1 :cores 1
+                                 :mem-bytes 4294967296
+                                 :kekkai {:node-id "judah"
+                                          :ssh-user ssh-user
+                                          :ssh-local-port ssh-port}}]})
+           ledger-file (.join path dir "murakumo-task-ledger.edn")
+           admission-ledger (.join path dir "no-kekkai-admission-ledger.edn")
+           _ (.mkdirSync fs bin-dir #js {:recursive true})
+           _ (.writeFileSync fs ssh-config
+                             (str "Host 127.0.0.1\n"
+                                  "  User " ssh-user "\n"
+                                  "  IdentityFile " ssh-key "\n"
+                                  "  IdentitiesOnly yes\n"
+                                  "  StrictHostKeyChecking no\n"
+                                  "  UserKnownHostsFile /dev/null\n"))
+           _ (.writeFileSync fs wrapper
+                             (str "#!/bin/sh\nexec /usr/bin/ssh -F \""
+                                  ssh-config "\" \"$@\"\n"))
+           _ (.chmodSync fs wrapper 448)
+           env (js/Object.assign #js {} (.-env js/process))
+           old-path (or (aget env "PATH") "")
+           _ (aset env "PATH" (str bin-dir (.-delimiter path) old-path))
+           _ (aset env "MURAKUMO_KEKKAI_LEDGER" admission-ledger)
+           argv #js ["--backend" "sci" "src/murakumo/task.cljk" "run"
+                     "--fleet" fleet-file "--ledger" ledger-file
+                     "--transport" "kekkai" "--nodes" "judah"
+                     "--no-probe" "--no-multiplex" "--no-worker"
+                     "--n" "1" "--attempts" "1"
+                     "--cmd" "printf MURAKUMO_KEKKAI_SSH_OK"
+                     "--format" "edn"]
+           child (.spawn cp "kbb" argv #js {:cwd murakumo-root :env env})
+           out (atom "") err (atom "")]
+       (.on (.-stdout child) "data" #(swap! out str (.toString %)))
+       (.on (.-stderr child) "data" #(swap! err str (.toString %)))
+       (.on child "close" (fn [code] (resolve {:code code :out @out :err @err})))
+       (.on child "error" (fn [e]
+                            (resolve {:code -1 :out @out :err (str e)})))))))
 
 ;; ── the service being forwarded ─────────────────────────────────────────────
 
@@ -155,14 +242,177 @@
        (.on sock "close" (fn [] (resolve (not @got))))
        (js/setTimeout (fn [] (.destroy sock) (resolve (not @got))) 3000)))))
 
+(defn- connect-packet-bridge [socket-path]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [socket (.createConnection net socket-path)]
+       (.once socket "connect" #(resolve socket))
+       (.once socket "error" reject)))))
+
+(defn- force-relay-route! [agent-handle]
+  (let [now (.getTime (js/Date.))]
+    (swap! (:state agent-handle)
+           update :peers
+           (fn [peers]
+             (into {} (map (fn [[peer-id p]]
+                             [peer-id (-> p
+                                          (update :disco
+                                                  #(assoc % :active :relay :paths {}
+                                                          :last-call-me-maybe now
+                                                          :config (assoc (:config %)
+                                                                         :call-me-maybe-ms 60000)))
+                                          (assoc-in [:policy :rekey-after-time] 2)
+                                          (assoc-in [:policy :rekey-timeout] 5)
+                                          (assoc-in [:session :policy :rekey-after-time] 2))])
+                           peers))))))
+
+(defn- accelerate-rekey! [agent-handle]
+  (swap! (:state agent-handle)
+         update :peers
+         (fn [peers]
+           (into {} (map (fn [[peer-id p]]
+                           [peer-id (-> p
+                                        (assoc-in [:policy :rekey-after-time] 2)
+                                        (assoc-in [:policy :rekey-timeout] 5)
+                                        (assoc-in [:session :policy :rekey-after-time] 2))])
+                         peers)))))
+
+(defn- advertise-ipv6-loopback! [agent-handle]
+  ;; The E2E binds the data-plane sockets to ::1. Publish that exact socket
+  ;; endpoint so the peers exercise authenticated discovery and direct UDP,
+  ;; rather than merely labeling an arbitrary local interface as reachable.
+  (let [port (udp/local-port (:sock @(:state agent-handle)))]
+    (swap! (:state agent-handle) assoc :local-candidates [(str "[::1]:" port)])
+    port))
+
+(defn- direct-ipv6-active? [agent-handle]
+  (let [peer (first (:peers ((:status agent-handle))))]
+    (and (= :direct (get-in peer [:report :via]))
+         (str/starts-with? (:path peer) "[::1]:"))))
+
+(defn- connect-packet-bridges [packet-a packet-b swift-bridge-client]
+  (if swift-bridge-client
+    (connect-packet-bridge packet-b)
+    (js/Promise.all
+     #js [(connect-packet-bridge packet-a)
+          (connect-packet-bridge packet-b)])))
+
+(defn- await-direct-ipv6! [state packet-a packet-b swift-bridge-client]
+  (note "advertising each agent's IPv6 loopback UDP socket")
+  (advertise-ipv6-loopback! (:a @state))
+  (advertise-ipv6-loopback! (:b @state))
+  (-> (wait-for
+       #(and (direct-ipv6-active? (:a @state))
+             (direct-ipv6-active? (:b @state)))
+       {:timeout-ms 15000 :interval-ms 100})
+      (.then (fn [direct?]
+               (check direct?
+                      "both peers selected authenticated direct IPv6 loopback paths"
+                      {:asher ((:status (:a @state)))
+                       :judah ((:status (:b @state)))})
+               (when direct?
+                 (accelerate-rekey! (:a @state))
+                 (accelerate-rekey! (:b @state)))
+               (connect-packet-bridges packet-a packet-b swift-bridge-client)))))
+
+(defn- stop-backup-after-direct! [state]
+  (note "stopping the backup relay after direct-path rekey to verify SSH survives relay loss")
+  ((:stop (:backup-relay @state)))
+  (swap! state assoc :backup-stopped? true)
+  (-> (sleep 1600)
+      (.then (fn [_]
+               (let [direct? (and (direct-ipv6-active? (:a @state))
+                                  (direct-ipv6-active? (:b @state)))]
+                 (check direct?
+                        "both peers kept their direct IPv6 paths after relay shutdown"
+                        {:asher ((:status (:a @state)))
+                         :judah ((:status (:b @state)))})
+                 direct?)))))
+
+(defn- defer-rekey! [agent-handle]
+  (swap! (:state agent-handle)
+         update :peers
+         (fn [peers]
+           (into {} (map (fn [[peer-id p]]
+                           [peer-id (-> p
+                                        (assoc-in [:policy :rekey-after-time] 300)
+                                        (assoc-in [:session :policy :rekey-after-time] 300))])
+                         peers)))))
+
+(defn- swift-bridge-send
+  "Send the fixed IPv4 and IPv6 E2E packets through an Apple bridge client."
+  [binary socket-path]
+  (js/Promise.
+   (fn [resolve _]
+     (let [child (.spawn cp binary #js [socket-path])
+           out (atom "")
+           err (atom "")]
+       (.on (.-stdout child) "data" #(swap! out str (.toString %)))
+       (.on (.-stderr child) "data" #(swap! err str (.toString %)))
+       (.on child "close" (fn [code] (resolve {:code code :out @out :err @err})))
+       (.on child "error" (fn [error]
+                            (resolve {:code -1 :out @out :err (str error)})))))))
+
+(defn- write-packet-frame! [socket bytes]
+  (let [body (.from js/Buffer (clj->js bytes))
+        header (.alloc js/Buffer 4)]
+    (.writeUInt32BE header (.-length body) 0)
+    (.write socket (.concat js/Buffer #js [header body]))))
+
+(defn- receive-packet-frames [socket expected-count]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [buffer (atom (.alloc js/Buffer 0))
+           packets (atom [])
+           done? (atom false)
+           timer (js/setTimeout
+                  #(when-not @done?
+                     (reset! done? true)
+                     (reject (js/Error. "TUN packet receive timeout"))) 10000)
+           fail (fn [error]
+                  (when-not @done?
+                    (reset! done? true)
+                    (js/clearTimeout timer)
+                    (reject error)))]
+       (.on socket "data"
+            (fn [chunk]
+              (when-not @done?
+                (swap! buffer (fn [current]
+                                (.concat js/Buffer #js [current chunk])))
+                (loop []
+                  (when (and (not @done?) (>= (.-length @buffer) 4))
+                    (let [length (.readUInt32BE @buffer 0)
+                          frame-size (+ 4 length)]
+                      (cond
+                        (or (zero? length) (> length packet/max-packet-bytes))
+                        (fail (js/Error. "invalid packet bridge frame"))
+
+                        (>= (.-length @buffer) frame-size)
+                        (do
+                          (swap! packets conj
+                                 (vec (js/Uint8Array.
+                                       (.subarray @buffer 4 frame-size))))
+                          (swap! buffer #(.subarray % frame-size))
+                          (if (= expected-count (count @packets))
+                            (do (reset! done? true)
+                                (js/clearTimeout timer)
+                                (resolve @packets))
+                            (recur)))
+
+                        :else nil))))))
+       (.once socket "error" fail)
+       (.once socket "close" #(fail (js/Error. "TUN packet bridge closed"))))))))
+
 ;; ── optional: a real ssh client through the forwarder ───────────────────────
 
 (defn- ssh-through
-  "Run `ssh -p <port> -o … localhost true`. -> Promise of {:code :err}."
-  [port user]
+  "Run a real SSH command through a Kekkai local forward."
+  [port user ssh-key]
   (js/Promise.
    (fn [resolve _]
      (let [args #js ["-p" (str port)
+                     "-i" ssh-key
+                     "-o" "IdentitiesOnly=yes"
                      "-o" "StrictHostKeyChecking=no"
                      "-o" "UserKnownHostsFile=/dev/null"
                      "-o" "BatchMode=yes"
@@ -177,67 +427,111 @@
        (.on ps "error" (fn [e] (resolve {:code -1 :out @out :err (str e)})))))))
 
 (defn -main [& args]
-  (println "\nkekkai-node stream E2E — TCP forwarded over the real overlay\n")
-  (let [ssh-target (second (drop-while #(not= "--ssh" %) args))
+  (println "\nkekkai-node single-agent stream + TUN E2E\n")
+  (let [ssh-target (arg-value args "--ssh")
+        ssh-key (arg-value args "--ssh-key")
+        murakumo-root (arg-value args "--murakumo-root")
+        relay-host (or (arg-value args "--relay-host") "127.0.0.1")
+        direct-ipv6? (some #(= "--direct-ipv6" %) args)
+        swift-bridge-client (arg-value args "--swift-bridge-client")
+        ssh-parts (when ssh-target (.split ssh-target "@"))
+        ssh-user (when ssh-parts (aget ssh-parts 0))
+        ssh-service-port (when ssh-parts (js/parseInt (aget ssh-parts 1) 10))
+        _ (when (and ssh-target
+                     (not (and (seq ssh-user) (string? ssh-key) (seq ssh-key)
+                               (number? ssh-service-port)
+                               (<= 1 ssh-service-port 65535))))
+            (throw (js/Error. "use --ssh <user@port> --ssh-key <private-key>")))
+        _ (when (and murakumo-root (not ssh-target))
+            (throw (js/Error. "--murakumo-root requires --ssh and --ssh-key")))
+        _ (when (and direct-ipv6? (not= relay-host "::1"))
+            (throw (js/Error. "--direct-ipv6 requires --relay-host ::1")))
         dir (.mkdtempSync fs (.join path (.tmpdir os) "kekkai-stream-e2e-"))
-        relay-key (hex-keypair) a-key (hex-keypair) b-key (hex-keypair)
-        reg-a (atom {}) reg-b (atom {})
+        relay-key (hex-keypair) backup-relay-key (hex-keypair)
+        a-key (hex-keypair) b-key (hex-keypair)
+        authority (signing-authority)
+        packet-a (.join path dir "asher.packet.sock")
+        packet-b (.join path dir "judah.packet.sock")
         st (atom {})]
     (-> (echo-server)
         (.then
          (fn [[echo service-port]]
            (swap! st assoc :echo echo :service-port service-port)
            (println (str "  echo service on 127.0.0.1:" service-port))
-           (relay-server/start
-            {:port 0 :host "127.0.0.1"
-             :static {:priv (b/unhex (:priv relay-key)) :pub (b/unhex (:pub relay-key))}
-             :region "test"
-             :prologue (b/utf8-encode
-                        (netmap/prologue-string {:netmap/tailnet "kekkai.test"
-                                                 :netmap/version 1}))
-             :on-event (fn [_])})))
+           (js/Promise.all
+            #js [(relay-server/start
+                  {:port 0 :host relay-host
+                   :static {:priv (b/unhex (:priv relay-key)) :pub (b/unhex (:pub relay-key))}
+                   :region "primary"
+                   :prologue (b/utf8-encode
+                              (netmap/prologue-string {:netmap/tailnet "kekkai.test"
+                                                       :netmap/version 1}))
+                   :on-event (fn [_])})
+                 (relay-server/start
+                  {:port 0 :host relay-host
+                   :static {:priv (b/unhex (:priv backup-relay-key))
+                            :pub (b/unhex (:pub backup-relay-key))}
+                   :region "backup"
+                   :prologue (b/utf8-encode
+                              (netmap/prologue-string {:netmap/tailnet "kekkai.test"
+                                                       :netmap/version 1}))
+                   :on-event (fn [_])})])))
         (.then
-         (fn [relay]
-           (swap! st assoc :relay relay)
-           (let [relay-port (udp/local-port (:sock relay))
+         (fn [[relay backup-relay]]
+           (swap! st assoc :relay relay :backup-relay backup-relay)
+           (let [relay-records [{:relay/name "test-1" :relay/region "primary"
+                                 :relay/host relay-host
+                                 :relay/port (udp/local-port (:sock relay))
+                                 :relay/key (:pub relay-key)}
+                                {:relay/name "test-2" :relay/region "backup"
+                                 :relay/host relay-host
+                                 :relay/port (udp/local-port (:sock backup-relay))
+                                 :relay/key (:pub backup-relay-key)}]
                  service-port (:service-port @st)
-                 _ (println (str "  relay on 127.0.0.1:" relay-port))
-                 nm-a (netmap-for "asher" "judah" a-key b-key relay-key relay-port
-                                  service-port)
-                 nm-b (netmap-for "judah" "asher" b-key a-key relay-key relay-port
-                                  service-port)
+                 service-ports (cond-> [service-port]
+                                 ssh-service-port (conj ssh-service-port))
+                 _ (println (str "  relay primary/backup on " relay-host ":"
+                                 (:relay/port (first relay-records)) "/"
+                                 (:relay/port (second relay-records))))
+                 nm-a (netmap-for "asher" "judah" a-key b-key relay-records
+                                  service-ports)
+                 nm-b (netmap-for "judah" "asher" b-key a-key relay-records
+                                  service-ports)
+                 forwards (cond-> [{:listen-port 0 :peer "judah"
+                                    :port service-port :capability :ssh}]
+                            ssh-service-port
+                            (conj {:listen-port 0 :peer "judah"
+                                   :port ssh-service-port :capability :ssh}))
                  fast {:tick-ms 200
                        :policy {:rekey-timeout 1 :keepalive-timeout 3}
+                       :relay {:keepalive-ms 300 :pong-timeout-ms 800
+                               :hello-retry-ms 200 :handshake-timeout-ms 1200}
                        :disco {:call-me-maybe-ms 400 :probe-timeout-ms 400
                                :heartbeat-ms 1000}}]
              (js/Promise.all
-              #js [(agent/start
+              #js [(runtime/start
                     {:config (merge fast {:node/id "asher" :static a-key
-                                          :allow-unsigned-netmap? true
-                                          :netmap-file (write-edn! dir "nm-a.edn" nm-a)
-                                          :listen-port 0})
-                     :on-event (fn [e]
-                                 (when (and (= :data (:event e)) (:a @st))
-                                   (edge/on-peer-data reg-a (:a @st) e)))})
-                   (agent/start
+                                          :netmap-authority-spki-b64 (:spki authority)
+                                          :netmap-file (write-signed-netmap!
+                                                        dir "nm-a.edn" authority nm-a)
+                                          :listen-port 0
+                                          :listen-host relay-host
+                                          :forwards forwards
+                                          :packet-bridge {:path packet-a}})
+                     :on-event #(swap! observed-events conj (assoc % :node "asher"))})
+                   (runtime/start
                     {:config (merge fast {:node/id "judah" :static b-key
-                                          :allow-unsigned-netmap? true
-                                          :netmap-file (write-edn! dir "nm-b.edn" nm-b)
-                                          :listen-port 0})
-                     :on-event (fn [e]
-                                 (when (and (= :data (:event e)) (:b @st))
-                                   (edge/on-peer-data reg-b (:b @st) e)))})]))))
+                                          :netmap-authority-spki-b64 (:spki authority)
+                                          :netmap-file (write-signed-netmap!
+                                                        dir "nm-b.edn" authority nm-b)
+                                          :listen-port 0
+                                          :listen-host relay-host
+                                          :packet-bridge {:path packet-b}})
+                     :on-event #(swap! observed-events conj (assoc % :node "judah"))})]))))
         (.then
          (fn [[a bnode]]
            (swap! st assoc :a a :b bnode)
-           ;; The agents' on-event closures read (:a @st)/(:b @st), which are set
-           ;; only now — the handle does not exist when start is called. Frames
-           ;; before this point would be dropped, so nothing is sent until the
-           ;; sessions are up, which is the next wait anyway.
-           (swap! st assoc
-                  :timer-a (js/setInterval #(edge/tick! reg-a (:a @st)) 50)
-                  :timer-b (js/setInterval #(edge/tick! reg-b (:b @st)) 50))
-           (note "waiting for both Noise sessions to establish")
+           (note "waiting for one Noise agent per node to establish")
            ;; Through the agent's own `:status`, not by reaching into its state
            ;; atom: the internal peer map is keyed and shaped for the agent, and
            ;; a test that reads it is asserting on an implementation detail that
@@ -252,19 +546,75 @@
         (.then
          (fn [up?]
            (check up? "both agents established a Noise session")
-           (let [service-port (:service-port @st)
-                 server (edge/forward! reg-a (:a @st)
-                                       {:listen-port 0 :peer "judah"
-                                        :port service-port :capability :ssh})]
-             (swap! st assoc :fwd server)
+           (note "stopping the primary relay to exercise signed-order failover")
+           ((:stop (:relay @st)))
+           (swap! st assoc :primary-stopped? true)
+           (-> (wait-for
+                (fn []
+                  (let [ra (:relay ((:status (:a @st))))
+                        rb (:relay ((:status (:b @st))))]
+                    (and (= "test-2" (:name ra)) (:connected? ra)
+                         (= "test-2" (:name rb)) (:connected? rb))))
+                {:timeout-ms 10000 :interval-ms 100})
+               (.then (fn [failed-over?]
+                        (check failed-over?
+                               "both agents authenticated to the backup relay after primary loss")
+                        (check (every? some?
+                                       (for [node ["asher" "judah"]]
+                                         (some #(and (= :relay-failover (:event %))
+                                                     (= node (:node %))
+                                                     (= "test-2" (:to %)))
+                                               @observed-events)))
+                               "each agent emitted its relay failover event")
+                        (if direct-ipv6?
+                          (await-direct-ipv6! st packet-a packet-b swift-bridge-client)
+                          (do
+                            ;; Force application checks over the backup relay,
+                            ;; proving it carries peer traffic after failover.
+                            (force-relay-route! (:a @st))
+                            (force-relay-route! (:b @st))
+                            (connect-packet-bridges packet-a packet-b
+                                                    swift-bridge-client))))))))
+        (.then
+         (fn [packet-sides]
+           (let [sidecar-a (when-not swift-bridge-client (aget packet-sides 0))
+                 sidecar-b (if swift-bridge-client packet-sides
+                               (aget packet-sides 1))]
+           (swap! st assoc :packet-a sidecar-a :packet-b sidecar-b)
+           (let [received (receive-packet-frames sidecar-b 2)
+                 sent (if swift-bridge-client
+                        (swift-bridge-send swift-bridge-client packet-a)
+                        (do (write-packet-frame! sidecar-a ipv4-packet)
+                            (write-packet-frame! sidecar-a ipv6-packet)
+                            (js/Promise.resolve {:code 0})))]
+             (-> (js/Promise.all #js [received sent])
+                 (.then (fn [[packet send-result]]
+                          (when swift-bridge-client
+                            (check (= 0 (:code send-result))
+                                   "Swift local transport sent IPv4 and IPv6 packets"
+                                   send-result))
+                          {:ipv4 (first packet) :ipv6 (second packet)})))))))
+        (.then
+         (fn [received]
+           (check (= ipv4-packet (:ipv4 received))
+                  (if swift-bridge-client
+                    "Swift local transport routes signed IPv4 through Noise"
+                    "the same agent routes signed IPv4 through Noise")
+                  {:received (count (:ipv4 received))})
+           (check (= ipv6-packet (:ipv6 received))
+                  (if swift-bridge-client
+                    "Swift local transport routes signed IPv6 through Noise"
+                    "the same agent routes signed IPv6 through Noise")
+                  {:received (count (:ipv6 received))})
+           (let [server (first (:forwarders (:a @st)))
+                 service-port (:service-port @st)]
              (-> (listening server)
                  (.then (fn [port]
                           (swap! st assoc :fwd-port port)
                           (println (str "  forwarder on 127.0.0.1:" port
                                         " -> judah:" service-port))
-                          ;; A small interactive-sized exchange first: that is
-                          ;; the shape ssh actually has, and the one this
-                          ;; transport is for.
+                          ;; An interactive-sized exchange is the shape SSH
+                          ;; actually has, and the one this transport is for.
                           (tcp-exchange port (vec (map #(mod % 251) (range 64)))
                                         64 15000)))))))
         (.then
@@ -272,12 +622,37 @@
            (check (= (vec (map #(mod % 251) (range 64))) got)
                   "an interactive-sized exchange round-trips through the overlay"
                   {:got (count got)})
-           (note "now a payload larger than one segment and one window")
-           ;; 40 KB: past max-segment-bytes (700) and past a single window, so
-           ;; this exercises segmentation, cumulative acks and flow control
-           ;; rather than a single frame that happened to fit.
-           (tcp-exchange (:fwd-port @st) (vec (map #(mod % 251) (range 40000)))
-                         40000 40000)))
+           (note "waiting for the proactive rekey handshake over the live path")
+           (-> (wait-for
+                (fn []
+                  (let [events (set (map :event @observed-events))]
+                    (and (contains? events :rekey-started)
+                         (contains? events :rekey-staged))))
+                {:timeout-ms 10000 :interval-ms 100})
+               (.then (fn [rekey?]
+                        (check rekey?
+                               "the responder staged a proactive Noise rekey over the live UDP path"
+                               {:counts (frequencies (map :event @observed-events))
+                                :key-events (take-last
+                                             30
+                                             (filter #(#{:rekey-started :rekey-staged
+                                                         :rekey-promoted :rekey-gave-up
+                                                         :established :stale-handshake-resp
+                                                         :handshake-failed :relay-failover
+                                                         :relay-timeout :connected :dropped}
+                                                        (:event %))
+                                                     @observed-events))})
+                        ;; The responder promotes the staged session on its
+                        ;; first valid new-key packet, so the bulk transfer
+                        ;; below is the data-plane promotion check. Keep it
+                        ;; from racing another intentionally accelerated rekey.
+                        (defer-rekey! (:a @st))
+                        (defer-rekey! (:b @st))
+                        (note "sending a payload large enough to promote the new receive key")
+                        ;; 40 KB exercises segmentation and flow control after rekey.
+                        (tcp-exchange (:fwd-port @st)
+                                      (vec (map #(mod % 251) (range 40000)))
+                                      40000 40000))))))
         (.then
          (fn [got]
            (let [want (vec (map #(mod % 251) (range 40000)))]
@@ -288,14 +663,22 @@
                       {:first-diff (first (keep-indexed
                                            (fn [i [x y]] (when (not= x y) i))
                                            (map vector want got)))})))
-           ;; Authorisation: the netmap grants :ssh on the service port only.
-           ;; A forward aimed at a different port must be refused locally, and
-           ;; the stream must never be opened.
-           (let [server (edge/forward! reg-a (:a @st)
-                                       {:listen-port 0 :peer "judah"
-                                        :port 9999 :capability :ssh})]
-             (swap! st assoc :bad server)
-             (.then (listening server) tcp-refused?))))
+           (check (some #(= :rekey-promoted (:event %)) @observed-events)
+                  "a valid new-key packet promoted the responder session"
+                  {:counts (frequencies (map :event @observed-events))})
+           (let [denied-port-check
+                 (fn []
+                   ;; Authorisation: the netmap grants :ssh on the service port
+                   ;; only. A forward to another port must be refused locally.
+                   (let [server (edge/forward! (:stream-registry (:a @st)) (:a @st)
+                                               {:listen-port 0 :peer "judah"
+                                                :port 9999 :capability :ssh})]
+                     (swap! st assoc :bad server)
+                     (.then (listening server) tcp-refused?)))]
+             (if direct-ipv6?
+               (-> (stop-backup-after-direct! st)
+                   (.then (fn [_] (denied-port-check))))
+               (denied-port-check)))))
         (.then
          (fn [refused?]
            (check refused? "a port the netmap does not grant is refused, deny-by-default")
@@ -305,17 +688,17 @@
            ;; the forwarder's is a courtesy, the service's is the boundary.
            (let [frame {:kind :open :stream-id 4242 :seq 0 :ack 0 :window 32768
                         :payload (vec (b/utf8-encode "ssh 9999"))}]
-             (edge/on-peer-data reg-b (:b @st)
+             (edge/on-peer-data (:stream-registry (:b @st)) (:b @st)
                                 {:peer "asher" :payload (stream/encode frame)})
              (sleep 500))))
         (.then
          (fn [_]
-           (check (nil? (get @reg-b ["asher" 4242]))
+           (check (nil? (get @(:stream-registry (:b @st)) ["asher" 4242]))
                   "the service refused an unauthorised OPEN without connecting")
            ;; Granted port, :funnel capability: the grant is real, but it is for
            ;; public HTTP through access-edge's connector, never a raw stream.
            (swap! st assoc :echo-before @echo-connections)
-           (edge/on-peer-data reg-b (:b @st)
+           (edge/on-peer-data (:stream-registry (:b @st)) (:b @st)
                               {:peer "asher"
                                :payload (stream/encode
                                          {:kind :open :stream-id 4343 :seq 0 :ack 0
@@ -329,11 +712,14 @@
                   "a :funnel grant does not open a raw stream to the same port"
                   {:connections-during (- @echo-connections (:echo-before @st))})
            (if-not ssh-target
-             (do (note "no --ssh <user@host-port> given; skipping the real ssh leg")
+             (do (note "no --ssh <user@port> given; skipping the real ssh leg")
                  (js/Promise.resolve nil))
-             (let [[user] (str/split ssh-target #"@")]
-               (note (str "driving a real ssh client through the forwarder as " user))
-               (ssh-through (:fwd-port @st) user)))))
+             (let [server (second (:forwarders (:a @st)))]
+               (-> (listening server)
+                   (.then (fn [port]
+                            (swap! st assoc :ssh-fwd-port port)
+                            (note (str "driving a real SSH client through Kekkai as " ssh-user))
+                            (ssh-through port ssh-user ssh-key))))))))
         (.then
          (fn [ssh-result]
            (when ssh-result
@@ -341,17 +727,34 @@
                          (str/includes? (:out ssh-result) "kekkai-ssh-ok"))
                     "a real ssh session completed through the overlay"
                     (select-keys ssh-result [:code :err])))
-           (js/clearInterval (:timer-a @st))
-           (js/clearInterval (:timer-b @st))
-           (.close (:fwd @st))
+           (if murakumo-root
+             (do
+               (note "driving Murakumo task CLI through the same Kekkai SSH forward")
+               (murakumo-task-through dir murakumo-root (:ssh-fwd-port @st)
+                                      ssh-user ssh-key))
+             (js/Promise.resolve nil))))
+        (.then
+         (fn [murakumo-result]
+           (when murakumo-root
+             (check (and (= 0 (:code murakumo-result))
+                         (str/includes? (:out murakumo-result)
+                                        "MURAKUMO_KEKKAI_SSH_OK"))
+                    "Murakumo task CLI completed SSH over Kekkai"
+                    (select-keys murakumo-result [:code :out :err])))
+           (when (:packet-a @st) (.destroy (:packet-a @st)))
+           (when (:packet-b @st) (.destroy (:packet-b @st)))
            (when (:bad @st) (.close (:bad @st)))
            (.close (:echo @st))
            ((:stop (:a @st)))
            ((:stop (:b @st)))
-           ((:stop (:relay @st)))
+           (when-not (:primary-stopped? @st)
+             ((:stop (:relay @st))))
+           (when-not (:backup-stopped? @st)
+             ((:stop (:backup-relay @st))))
            (sleep 300)))
         (.then
          (fn [_]
+           (.rmSync fs dir #js {:recursive true :force true})
            (println)
            (if (seq @failures)
              (do (println (str "STREAM E2E FAILED: " (str/join ", " @failures)))

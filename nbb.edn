@@ -1,11 +1,11 @@
-;; Source paths only — deliberately NO :deps. An `nbb.edn` with `:deps` makes nbb
+;; KBB source paths plus first-party portable dependencies. An `nbb.edn` with `:deps` makes nbb
 ;; shell out to **bb** (babashka) to resolve them, which this workspace retired as
 ;; a script host (ADR-2607173000) and which is absent on CI: the first CI run
 ;; failed with `/bin/sh: 1: bb: not found` while every local run was green, because
 ;; this workstation has bb installed. Siblings go on the command line:
 ;;
 ;;   CP="src:test:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src"
-;;   kbb --backend sci --classpath "$CP" run-tests.cljk
+;;   kbb --classpath "$CP" run-tests.cljk
 {:paths ["src" "test"]
  :deps {
         ;; kotoba.lang.coll replaced clojure.set here (2026-09-24). An explicit
@@ -25,4 +25,12 @@
         ;; read deps.edn or bb.edn, and the .cljs in this repo are run as
         ;; bare `nbb <file>`. A coordinate they cannot see is not a
         ;; declaration. sha and :paths are COPIED from deps.edn.
-        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}}}
+        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
+        ;; Node heartbeat signatures use the same enrolled did:key as the
+        ;; control plane; keep this runtime pin aligned with Kekkai's publisher.
+        io.github.kotoba-lang/bytes {:git/sha "d5259f35ab7c4f5a66e63ca29ed4dcf7ba3f1ac5"}
+        io.github.kotoba-lang/org-ietf-ed25519 {:sha "fdcefb9f1b83461fee54d04b63e374fa301ee847"}
+        ;; Desired-state mirror verification checks the authority's key-derived
+        ;; IPNS name before installing a node-readable signed netmap.
+        io.github.kotoba-lang/tech-ipfs-specs-ipns
+        {:sha "f2563eb1cb010c96f6dec1dfbd468fac93367498"}}}

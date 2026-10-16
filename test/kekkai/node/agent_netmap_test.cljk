@@ -1,0 +1,281 @@
+(ns kekkai.node.agent-netmap-test
+  (:require [kotoba.test :refer [deftest is async testing]]
+            [kotoba.bytes :as b]
+            [kekkai.node.agent :as agent]
+            [kekkai.node.netmap :as netmap]
+            [kekkai.node.stream-edge :as stream-edge]
+            [noise.core :as noise]
+            [noise.provider.node :as provider]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+(def suite (noise/suite (provider/ports)))
+
+(defn- authority []
+  (let [pair (.generateKeyPairSync crypto "ed25519")]
+    {:private (.-privateKey pair)
+     :spki (.toString (.export (.-publicKey pair)
+                               #js {:format "der" :type "spki"})
+                      "base64")}))
+
+(defn- signed-text [{:keys [private spki]} value]
+  (let [payload (binding [*print-namespace-maps* false
+                          *print-length* nil
+                          *print-level* nil]
+                  (pr-str value))
+        bytes (.from js/Buffer payload "utf8")
+        signature (.sign crypto nil bytes private)
+        digest (-> (.createHash crypto "sha256")
+                   (.update bytes)
+                   (.digest "hex"))]
+    (binding [*print-namespace-maps* false
+              *print-length* nil
+              *print-level* nil]
+      (pr-str {:netmap/payload-b64 (.toString bytes "base64")
+               :netmap/signature-b64 (.toString signature "base64")
+               :netmap/signer-spki-b64 spki
+               :netmap/sha256 digest}))))
+
+(defn- test-netmap [version self-key]
+  {:netmap/version version
+   :netmap/tailnet "reload.test"
+   :netmap/self {:node/id "node-a" :node/key self-key}
+   :netmap/peers []
+   :netmap/edges []
+   :netmap/relays []})
+
+(deftest configured-excluded-hosts-filter-signed-peer-endpoints
+  (let [static (noise/keypair suite)
+        self-key (b/hex (:pub static))
+        remote-key (b/hex (:pub (noise/keypair suite)))
+        nm (-> (test-netmap 1 self-key)
+               (assoc :netmap/peers
+                      [{:node/id "peer-b"
+                        :node/key remote-key
+                        :node/status "authorized"
+                        :node/endpoints ["100.108.223.94:41641"
+                                         "[fd7a:115c:a1e0::1234]:41641"
+                                         "198.51.100.8:41641"]}])
+               (assoc :netmap/edges
+                      [{:edge/from "node-a" :edge/to "peer-b"
+                        :edge/capabilities [:overlay] :edge/ports []}]))
+        config {:static {:priv (b/hex (:priv static))
+                         :pub self-key}
+                :candidate-excluded-hosts ["100.108.223.94"
+                                           "fd7a:115c:a1e0::1234"]}
+        state (-> (agent/state {:config config :nm nm})
+                  (agent/sync-peers 1000))]
+    (is (= #{"198.51.100.8:41641"}
+           (set (keys (get-in state [:peers "peer-b" :disco :paths])))))))
+
+(defn- wait-until [predicate timeout-ms]
+  (js/Promise.
+   (fn [resolve _reject]
+     (let [deadline (+ (.getTime (js/Date.)) timeout-ms)]
+       (letfn [(poll []
+                 (cond
+                   (predicate) (resolve true)
+                   (>= (.getTime (js/Date.)) deadline) (resolve false)
+                   :else (js/setTimeout poll 10)))]
+         (poll))))))
+
+(defn- write-atomic! [directory file text]
+  (let [temporary (.join path directory "netmap.next")]
+    (.writeFileSync fs temporary text #js {:mode 384})
+    (.renameSync fs temporary file)))
+
+(deftest reconfigure-resets-peer-sessions-and-binds-the-new-version
+  (let [static (noise/keypair suite)
+        self-key (b/hex (:pub static))
+        peer-key (noise/keypair suite)
+        peer-public (b/hex (:pub peer-key))
+        old (-> (test-netmap 1 self-key)
+                (assoc :netmap/peers [{:node/id "peer-b"
+                                       :node/key peer-public
+                                       :node/status "authorized"}])
+                (assoc :netmap/edges [{:edge/from "node-a" :edge/to "peer-b"
+                                      :edge/capabilities [:overlay]
+                                      :edge/ports []}]))
+        next (-> (test-netmap 2 self-key)
+                 (assoc :netmap/peers [{:node/id "peer-b"
+                                        :node/key peer-public
+                                        :node/status "authorized"}])
+                 (assoc :netmap/edges [{:edge/from "node-a" :edge/to "peer-b"
+                                       :edge/capabilities [:overlay]
+                                       :edge/ports []}]))
+        config {:node/id "node-a"
+                :static {:priv (b/hex (:priv static)) :pub self-key}}
+        initial (-> (agent/state {:config config :nm old})
+                    (agent/sync-peers 1000)
+                    (assoc-in [:peers "peer-b" :session-id] 9))
+        before (get-in initial [:peers "peer-b"])
+        {:keys [state events send]} (agent/reconfigure-netmap initial next 2000)
+        after (get-in state [:peers "peer-b"])]
+    (is (some? before))
+    (is (some? after))
+    (is (nil? (:session-id after)))
+    (is (not (identical? before after)))
+    (is (= (b/utf8-encode (netmap/prologue-string next)) (:prologue after)))
+    (is (empty? send))
+    (is (= {:event :netmap-updated
+            :from-version 1
+            :to-version 2
+            :reset-peers ["peer-b"]
+            :removed-peers []}
+           (first events)))
+    (testing "a lower or same version cannot restore stale policy"
+      (is (thrown? js/Error (agent/reconfigure-netmap state old 3000)))
+      (is (thrown? js/Error (agent/reconfigure-netmap state next 3000))))
+    (testing "a replacement cannot move this process to another node key"
+      (is (thrown? js/Error
+                   (agent/reconfigure-netmap
+                    state (assoc-in (test-netmap 3 self-key)
+                                    [:netmap/self :node/key] "deadbeef") 3000))))))
+
+(deftest netmap-version-change-closes-streams-bound-to-the-old-session
+  (let [registry (atom { ["peer-b" 1] {:peer "peer-b" :socket nil}
+                         [stream-edge/principals-key 41000] {:peer "peer-b"}})
+        handler (stream-edge/event-handler registry (atom nil))]
+    (handler {:event :netmap-updated :from-version 1 :to-version 2})
+    (is (empty? @registry))))
+
+(deftest resident-agent-polls-signed-netmaps-and-rejects-untrusted-replacements
+  (async done
+    (let [directory (.mkdtempSync fs (.join path (.tmpdir os) "kekkai-netmap-reload-"))
+          file (.join path directory "netmap.signed.edn")
+          signing-authority (authority)
+          attacker (authority)
+          static (noise/keypair suite)
+          self-key (b/hex (:pub static))
+          events (atom [])
+          handle (atom nil)
+          finished? (atom false)
+          finish (fn []
+                   (when-not @finished?
+                     (reset! finished? true)
+                     (when-let [h @handle] ((:stop h)))
+                     (.rmSync fs directory #js {:recursive true :force true})
+                     (done)))
+          initial (test-netmap 1 self-key)]
+      (write-atomic! directory file (signed-text signing-authority initial))
+      (-> (agent/start
+           {:config {:node/id "node-a"
+                     :static {:priv (b/hex (:priv static)) :pub self-key}
+                     :netmap-file file
+                     :netmap-authority-spki-b64 (:spki signing-authority)
+                     :netmap-poll-ms 25
+                     :listen-host "127.0.0.1"
+                     :tick-ms 50}
+            :on-event #(swap! events conj %)})
+          (.then
+           (fn [running]
+             (reset! handle running)
+             (let [version2 (test-netmap 2 self-key)
+                   version3 (test-netmap 3 self-key)]
+               (write-atomic! directory file
+                              (signed-text signing-authority version2))
+               (-> (wait-until #(= 2 (:netmap-version ((:status running)))) 1500)
+                   (.then
+                    (fn [updated?]
+                      (is updated? "the signed version 2 was applied")
+                      (is (some #(and (= :netmap-updated (:event %))
+                                      (= 2 (:to-version %))) @events))
+                      ;; Valid signature, wrong pinned authority: version 3 is held.
+                      (write-atomic! directory file (signed-text attacker version3))
+                      (wait-until #(some (fn [e]
+                                           (= :netmap-rejected (:event e)))
+                                         @events)
+                                  1500)))
+                   (.then
+                    (fn [rejected?]
+                      (is rejected? "the untrusted signer was rejected")
+                      (is (= 2 (:netmap-version ((:status running))))
+                          "the last trusted version remains active")
+                      ;; A later valid publication recovers without restarting.
+                      (write-atomic! directory file
+                                     (signed-text signing-authority version3))
+                      (wait-until #(= 3 (:netmap-version ((:status running)))) 1500)))
+                   (.then
+                    (fn [recovered?]
+                      (is recovered? "the later trusted version was applied")
+                      (is (= 3 (:netmap-version ((:status running)))))
+                      ;; A valid but stale publication is rejected without
+                      ;; escaping the polling timer or replacing live policy.
+                      (write-atomic! directory file
+                                     (signed-text signing-authority version2))
+                      (wait-until #(some (fn [e]
+                                           (and (= :netmap-rejected (:event e))
+                                                (= "replacement netmap version must increase"
+                                                   (:reason e))))
+                                         @events)
+                                  1500)))
+                   (.then
+                    (fn [stale-rejected?]
+                      (is stale-rejected? "a stale signed version was rejected")
+                      (is (= 3 (:netmap-version ((:status running))))
+                          "the last trusted version remains active")
+                      (finish)))
+                   (.catch
+                    (fn [error]
+                      (is false (str error))
+                      (finish))))))
+           (fn [error]
+             (is false (str error))
+             (finish)))))))
+
+(deftest resident-agent-starts-the-embedded-netmap-watcher
+  (async done
+    (let [directory (.mkdtempSync fs (.join path (.tmpdir os) "kekkai-netmap-embedded-"))
+          mirror (.join path directory "mirror")
+          file (.join path directory "netmap.signed.edn")
+          signing-authority (authority)
+          static (noise/keypair suite)
+          self-key (b/hex (:pub static))
+          events (atom [])
+          handle (atom nil)
+          finished? (atom false)
+          finish (fn []
+                   (when-not @finished?
+                     (reset! finished? true)
+                     (when-let [running @handle] ((:stop running)))
+                     (.rmSync fs directory #js {:recursive true :force true})
+                     (done)))
+          initial (test-netmap 1 self-key)]
+      (.mkdirSync fs mirror #js {:recursive true})
+      (write-atomic! directory file (signed-text signing-authority initial))
+      (-> (agent/start
+           {:config {:node/id "node-a"
+                     :static {:priv (b/hex (:priv static)) :pub self-key}
+                     :netmap-file file
+                     :netmap-authority-spki-b64 (:spki signing-authority)
+                     :netmap-watch {:roots [mirror]
+                                    :subject "default/node-a"
+                                    :poll-ms 250}
+                     :listen-host "127.0.0.1"
+                     :listen-port 0
+                     :stun-servers []
+                     :tick-ms 25
+                     :netmap-poll-ms 25}
+            :on-event #(swap! events conj %)} )
+          (.then
+           (fn [running]
+             (reset! handle running)
+             (is (= 1 (:netmap-version ((:status running))))
+                 "a cached signed map remains the startup source")
+             (-> (wait-until #(= :unavailable
+                                  (get-in ((:status running))
+                                          [:netmap-watch :status]))
+                             1500)
+                 (.then
+                  (fn [watcher-ready?]
+                    (is watcher-ready?
+                        "the embedded watcher reports that no publication is available")
+                    (is (get-in ((:status running)) [:netmap-watch :enabled?]))
+                    (is (some #(and (= :netmap-watch-result (:event %))
+                                    (= :unavailable (:status %))) @events))
+                    (finish))))))
+          (.catch (fn [error]
+                    (is false (str error))
+                    (finish)))))))

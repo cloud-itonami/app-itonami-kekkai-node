@@ -55,6 +55,32 @@
   [ep]
   (->str ep))
 
+(defn candidate-host
+  "Extract the address portion of a candidate string, including bracketed IPv6."
+  [candidate]
+  (if (map? candidate)
+    (:host candidate)
+    (let [candidate (str candidate)]
+      (if (.startsWith candidate "[")
+        (let [end (.indexOf candidate "]")]
+          (when (pos? end) (subs candidate 1 end)))
+        (let [separator (.lastIndexOf candidate ":")]
+          (when (pos? separator) (subs candidate 0 separator)))))))
+
+(defn exclude-candidate-hosts
+  "Remove local or peer candidates whose address matches a configured host.
+
+  This is useful when an interface must not be used as Kekkai's underlay (for
+  example, to keep a Kekkai test independent of another overlay installed on
+  the same machine). Matching is exact and case-insensitive; candidates on all
+  other addresses are preserved."
+  [candidates excluded-hosts]
+  (let [excluded (into #{} (map #(.toLowerCase (str %))) excluded-hosts)]
+    (filterv (fn [candidate]
+               (not (contains? excluded
+                               (some-> candidate candidate-host .toLowerCase))))
+             candidates)))
+
 (defn direct? [{:keys [kind]}] (contains? #{:local :reflexive} kind))
 
 (defn normalize

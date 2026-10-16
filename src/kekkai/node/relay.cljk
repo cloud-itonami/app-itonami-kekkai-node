@@ -29,6 +29,7 @@
      replay window then keeps an attacker from replaying from a forged address.
      An unauthenticated address update would be a trivial traffic-hijack."
   (:require [kotoba.bytes :as b]
+            [kotoba.lang.text :as str]
             [noise.core :as noise]))
 
 (def ^:const magic 0x6b)   ; 'k'
@@ -54,7 +55,9 @@
   {:client-idle-timeout-ms 90000
    :max-frame-bytes 65535
    :keepalive-ms 25000       ; under the 30s a typical NAT UDP mapping survives
-   :hello-retry-ms 2000})    ; see client-hello-due?
+   :pong-timeout-ms 15000    ; a missing relay reply invalidates its stale session
+   :hello-retry-ms 2000      ; see client-hello-due?
+   :handshake-timeout-ms 10000})
 
 ;; ── framing ─────────────────────────────────────────────────────────────────
 
@@ -210,9 +213,9 @@
 ;; ── client ──────────────────────────────────────────────────────────────────
 
 (defn client
-  [{:keys [suite static relay-key relay-addr region prologue config]}]
+  [{:keys [suite static relay-key relay-addr relay-name region prologue config]}]
   {:suite suite :static static :relay-key (vec relay-key) :relay-addr relay-addr
-   :region region :prologue (vec prologue) :config (merge defaults config)
+   :name relay-name :region region :prologue (vec prologue) :config (merge defaults config)
    ;; Newest first, same reason as kekkai.node.peer's :handshakes — a retry must
    ;; not invalidate the response to the previous attempt. Each attempt carries a
    ;; monotonic id, and a response is adopted only if its id is at least the one
@@ -222,7 +225,9 @@
    ;; E2E, which is exactly the sort of thing a unit test with one handshake in
    ;; flight cannot see.)
    :handshakes [] :hello-seq 0 :session-id nil :hello-at nil
-   :session nil :last-send nil})
+   :hello-started-at nil
+   :session nil :last-send nil :last-ping nil :last-response nil
+   :unanswered-ping-at nil})
 
 (defn client-hello
   "Start (or retry) the relay handshake. -> [state datagram]"
@@ -234,8 +239,39 @@
             :handshakes (vec (take 3 (cons {:id id :hs i} (:handshakes state))))
             :hello-seq id
             :hello-at now
+            :hello-started-at (or (:hello-started-at state) now)
             :last-send now)
      {:to relay-addr :bytes (encode-frame :handshake-init msg1)}]))
+
+(defn client-liveness-expired?
+  "Has any relay keepalive remained unanswered for the configured window?
+  Keep the first outstanding ping time: repeated unanswered pings must not
+  postpone detection forever. A direct peer path does not prove the relay is
+  still registered."
+  [{:keys [session unanswered-ping-at config]} now]
+  (and session
+       unanswered-ping-at
+       (>= (- now unanswered-ping-at) (:pong-timeout-ms config))))
+
+(defn client-reconnect
+  "Discard an unresponsive relay session and immediately begin a fresh
+  authenticated registration. Keep the monotonic handshake ID so delayed
+  responses from the expired session cannot replace the new session."
+  [state now]
+  (let [state (assoc state :session nil :handshakes [] :last-send nil
+                     :last-ping nil :last-response nil :unanswered-ping-at nil
+                     :hello-started-at nil
+                     :hello-at (- now (:hello-retry-ms (:config state))))]
+    (client-hello state now)))
+
+(defn client-handshake-expired?
+  "True when repeated relay registration attempts have produced no authenticated
+   response for the configured connect window. The caller may try another
+   published relay, or restart the handshake when this is the only relay."
+  [{:keys [session hello-started-at config]} now]
+  (and (nil? session)
+       hello-started-at
+       (>= (- now hello-started-at) (:handshake-timeout-ms config))))
 
 (defn client-hello-due?
   "Throttles reconnection. Without it, a caller with a fast tick loop re-registers
@@ -283,14 +319,19 @@
                 {:state (assoc state
                                :session-id id
                                :session (noise/session r {:now (quot now 1000)
-                                                          :peer-id "relay"}))
+                                                          :peer-id "relay"})
+                               :last-ping nil
+                               :last-response now
+                               :unanswered-ping-at nil
+                               :hello-started-at nil)
                  :send []
                  :events [{:event :connected :region (:region state) :attempt id}]})))))
 
       (and (= :session type) (:session state))
       (try
         (let [[sess inner-bytes] (noise/decrypt (:session state) payload {:now (quot now 1000)})
-              state (assoc state :session sess)
+              state (assoc state :session sess :last-response now
+                           :unanswered-ping-at nil)
               {:keys [type key payload error]} (decode-inner inner-bytes)]
           (if error
             {:state state :send [] :events [{:event :dropped :reason error}]}
@@ -327,11 +368,20 @@
   [state dst-key payload now]
   (client-emit state (encode-inner :signal {:key (vec dst-key) :payload payload}) now))
 
-(defn client-keepalive-due? [{:keys [config last-send]} now]
-  (>= (- now (or last-send 0)) (:keepalive-ms config)))
+(defn client-keepalive-due?
+  "Send a relay heartbeat after a quiet interval in received relay traffic.
+  Application sends do not count as liveness evidence: UDP send success only
+  means the local kernel accepted the datagram, not that the relay received it."
+  [{:keys [session config last-ping last-response]} now]
+  (let [last-proof (max (or last-ping 0) (or last-response 0))]
+    (and session
+         (>= (- now last-proof) (:keepalive-ms config)))))
 
 (defn client-ping [state payload now]
-  (client-emit state (encode-inner :ping {:payload payload}) now))
+  (let [[state datagram] (client-emit state (encode-inner :ping {:payload payload}) now)]
+    [(assoc state :last-ping now
+                  :unanswered-ping-at (or (:unanswered-ping-at state) now))
+     datagram]))
 
 ;; ── home relay selection ────────────────────────────────────────────────────
 
@@ -350,4 +400,18 @@
         (first (filter #(= prefer-region (:relay/region %)) relays))
         (first relays))))
 
-(defn relay-addr [{:keys [relay/host relay/port]}] (str host ":" port))
+(defn next-home
+  "Return the relay after `current-name` in the published order, wrapping at the
+   end. All nodes receiving the same signed netmap use the same failover order."
+  [relays current-name]
+  (when (seq relays)
+    (let [idx (or (first (keep-indexed
+                          (fn [i r] (when (= current-name (:relay/name r)) i))
+                          relays))
+                  -1)]
+      (nth relays (mod (inc idx) (count relays))))))
+
+(defn relay-addr [{:keys [relay/host relay/port]}]
+  (if (str/includes? (str host) ":")
+    (str "[" host "]:" port)
+    (str host ":" port)))

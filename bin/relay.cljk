@@ -1,7 +1,7 @@
 #!/usr/bin/env kbb
 ;; Run a relay. One publicly reachable UDP port; no state, no database.
 ;;
-;;   kbb --backend sci --classpath "src:..." bin/relay.cljk relay.edn
+;;   kbb --classpath "src:..." bin/relay.cljk relay.edn
 ;;
 ;; relay.edn: {:port 41642 :region "jp-tyo-1"
 ;;             :static {:priv "<hex>" :pub "<hex>"}
@@ -31,4 +31,11 @@
                   (js/console.error (str "relay failed: " (or (ex-message e) e)))
                   (set! (.-exitCode js/process) 1))))))
 
-(apply -main (drop 3 (js->clj (.-argv js/process))))
+(let [argv (vec (js->clj (.-argv js/process)))
+      script-index (last (keep-indexed
+                          (fn [i arg]
+                            (when (and (string? arg) (.endsWith arg "bin/relay.cljk")) i))
+                          argv))]
+  (when-not (some? script-index)
+    (throw (js/Error. "cannot locate bin/relay.cljk in process arguments")))
+  (apply -main (subvec argv (inc script-index))))

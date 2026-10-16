@@ -6,19 +6,27 @@
   (:require [cljs.test :as t]
             [kekkai.node.application-test]
             [kekkai.node.application-test]
+            [kekkai.node.agent-netmap-test]
+            [kekkai.node.agent-status-test]
+            [kekkai.node.heartbeat-test]
             [kekkai.node.disco-test]
+            [kekkai.node.endpoint-test]
             [kekkai.node.funnel-test]
             [kekkai.node.main-no-secret-test]
             [kekkai.node.launchd-test]
             [kekkai.node.magicdns-test]
             [kekkai.node.message-plane-test]
             [kekkai.node.netmap-test]
+            [kekkai.node.netmap-watch-test]
             [kekkai.node.packet-test]
+            [kekkai.node.packet-bridge-test]
             [kekkai.node.peer-test]
             [kekkai.node.publisher-parity-test]
             [kekkai.node.relay-test]
             [kekkai.node.signed-netmap-test]
-            [kekkai.node.stream-test]))
+            [kekkai.node.stun-test]
+            [kekkai.node.stream-test]
+            [kekkai.node.udp-underlay-test]))
 
 (defmethod t/report [::t/default :end-run-tests] [m]
   ;; Only the exit code — cljs.test's own default report already printed the
@@ -29,16 +37,24 @@
     (set! (.-exitCode js/process) 1)))
 
 (t/run-tests 'kekkai.node.application-test
+             'kekkai.node.agent-netmap-test
+             'kekkai.node.agent-status-test
+             'kekkai.node.heartbeat-test
              'kekkai.node.disco-test
+             'kekkai.node.endpoint-test
              'kekkai.node.funnel-test
              'kekkai.node.main-no-secret-test
              'kekkai.node.launchd-test
              'kekkai.node.magicdns-test
              'kekkai.node.message-plane-test
              'kekkai.node.netmap-test
+             'kekkai.node.netmap-watch-test
              'kekkai.node.packet-test
+             'kekkai.node.packet-bridge-test
              'kekkai.node.publisher-parity-test
              'kekkai.node.peer-test
              'kekkai.node.relay-test
              'kekkai.node.signed-netmap-test
-             'kekkai.node.stream-test)
+             'kekkai.node.stun-test
+             'kekkai.node.stream-test
+             'kekkai.node.udp-underlay-test)

@@ -2,9 +2,23 @@
  :static
  {:priv "<X25519_PRIVATE_KEY_HEX>"
   :pub "<X25519_PUBLIC_KEY_HEX>"}
+ :tailnet "kekkai.example"
  :netmap-file "/var/lib/kekkai/netmap.signed.edn"
  :netmap-authority-spki-b64 "<ED25519_AUTHORITY_SPKI_BASE64>"
+ ;; For macOS LaunchDaemon installs, set this to the node account's short name.
+ ;; When omitted, bin/install.cljk uses SUDO_USER, then USER.
+ ;; :launchd-user "kekkai"
+ ;; Override when KBB or node is installed outside the standard Homebrew paths.
+ ;; :launchd-path "/custom/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
  :listen-port 41641
- :stun-servers ["stun1.example.com:3478"]
+ ;; Use distinct STUN destinations; NAT mapping classification needs two answers.
+ :stun-servers ["stun1.example.com:3478" "stun2.example.com:3478"]
+ :stun-timeout-ms 5000
  :dns {:enabled? true :port 5354}
+ ;; One node runtime owns the packet bridge and optional SSH forwards, sharing
+ ;; one agent identity/session table:
+ :runner :node
+ ;; :forwards [{:listen-port 2222 :peer "judah" :port 22 :capability :ssh}]
+ ;; For macOS Packet Tunnel, use the socket shown by the host app inside the
+ ;; group.jp.kotoba.kekkai app-group container, not this Linux-style example.
  :packet-bridge {:path "/run/kekkai/packet.sock"}}

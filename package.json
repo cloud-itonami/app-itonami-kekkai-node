@@ -7,6 +7,8 @@
   },
   "scripts": {
     "test": "kbb --backend sci --classpath \"src:test:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src\" run-tests.cljk",
+    "netmap-watch": "kbb --backend sci --classpath \"src:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src\" -m kekkai.node.netmap-watch",
+    "heartbeat-keygen": "kbb --backend sci --classpath \"src:../bytes/src:../org-ietf-ed25519/src\" -m kekkai.node.heartbeat-keygen",
     "e2e": "kbb --backend sci --classpath \"src:test:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src\" test/e2e.cljk",
     "e2e:access": "kbb --backend sci --classpath \"src:test:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src\" test/access_edge_e2e.cljk",
     "e2e:funnel": "kbb --backend sci --classpath \"src:test:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src\" test/funnel_e2e.cljk",
@@ -16,9 +18,12 @@
     "tun-agent": "kbb --backend sci --classpath \"src:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src\" -m kekkai.node.packet-bridge",
     "build:packet-plane": "./scripts/build-packet-plane.sh",
     "verify:packet-plane": "node scripts/verify-packet-plane.mjs",
+    "test:apple-packet-plane": "./scripts/test-apple-packet-plane.sh",
+    "e2e:apple-packet-bridge": "./scripts/test-apple-packet-bridge-e2e.sh",
     "build:android-tunnel": "./platform/android/gradlew -p platform/android :app:assembleDebug",
     "test:android-tunnel": "./platform/android/gradlew -p platform/android :app:testDebugUnitTest",
     "e2e:stream": "kbb --backend sci --classpath \"src:test:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src\" test/stream_e2e.cljk",
+    "e2e:bootstrap-ssh": "./scripts/test-bootstrap-ssh-e2e.sh",
     "e2e:principal": "kbb --backend sci --classpath \"src:test:../bytes/src:../noise/src:../org-ietf-dns/src:../org-ietf-turn/src\" test/principal_e2e.cljk"
   }
 }

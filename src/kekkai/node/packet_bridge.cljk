@@ -2,8 +2,18 @@
   "Local-only framed bridge between a privileged OS TUN adapter and Kekkai."
   (:require [kekkai.node.agent :as agent]
             [kekkai.node.packet :as packet]
+            [kekkai.node.endpoint :as endpoint]
+            [kekkai.node.relay :as relay]
+            [kekkai.node.udp :as udp]
             ["node:fs" :as fs]
+            ["node:dns/promises" :as dns]
             ["node:net" :as net]))
+
+(def ^:private snapshot-magic "KKB1\u0001")
+(def ^:private ack-magic "KKB1\u0002")
+(def ^:private prepare-magic "KKB1\u0003")
+(def ^:private release-magic "KKB1\u0004")
+(def ^:private max-bridge-frame-bytes 262144)
 
 (defn- uint32 [value]
   (let [buffer (.alloc js/Buffer 4)]
@@ -14,6 +24,90 @@
   (let [body (.from js/Buffer (clj->js bytes))]
     (.write socket (.concat js/Buffer #js [(uint32 (.-length body)) body]))))
 
+(defn- write-underlay! [socket snapshot]
+  (let [json (.stringify js/JSON (clj->js snapshot))
+        body (.concat js/Buffer
+                      #js [(.from js/Buffer snapshot-magic)
+                           (.from js/Buffer json)])]
+    (.write socket (.concat js/Buffer #js [(uint32 (.-length body)) body]))))
+
+(defn- frame-type [bytes]
+  (when (and (>= (count bytes) 5)
+             (= [0x4b 0x4b 0x42 0x31] (subvec bytes 0 4)))
+    (nth bytes 4)))
+
+(defn- control-json [bytes]
+  (js->clj
+   (.parse js/JSON
+           (.toString
+            (.from js/Buffer (clj->js (subvec bytes 5)))
+            "utf8"))
+   :keywordize-keys true))
+
+(defn- destination-host [destination]
+  (when (string? destination)
+    (cond
+      (pos? (.isIP net destination)) destination
+      (re-find #"(?i)^[a-z][a-z0-9+.-]*://" destination)
+      (try
+        (let [host (.-hostname (js/URL. destination))]
+          (if (and (.startsWith host "[") (.endsWith host "]"))
+            (subs host 1 (dec (count host)))
+            host))
+        (catch :default _ nil))
+      :else (some-> (endpoint/parse destination) :host))))
+
+(defn underlay-hosts
+  "Hosts the OS tunnel must exclude so Kekkai control and data sockets keep
+  using the physical underlay while signed routes are installed."
+  [state]
+  (->> (concat
+        (get-in state [:config :stun-servers])
+        (get-in state [:config :underlay-exclusions])
+        [(get-in state [:config :heartbeat :url])]
+        [(get-in state [:config :netmap-watch :api-url])]
+        (get-in state [:config :netmap-watch :roots])
+        (map relay/relay-addr (:relay-pool state))
+        (for [[_ peer] (:peers state)
+              path (vals (get-in peer [:disco :paths]))
+              :let [host (get-in path [:endpoint :host])]
+              :when host]
+          (endpoint/->str {:host host :port 1})))
+       (keep destination-host)
+       distinct
+       sort
+       vec))
+
+(defn- resolve-host [host]
+  (if (pos? (.isIP net host))
+    (js/Promise.resolve [host])
+    (-> (.lookup dns host #js {:all true :verbatim true})
+        (.then (fn [records]
+                 (vec (distinct (map #(.-address %) (array-seq records)))))))))
+
+(defn- resolve-underlay [hosts]
+  (-> (js/Promise.all
+       (clj->js (mapv (fn [host]
+                        (-> (resolve-host host)
+                            (.then (fn [addresses]
+                                     {:host host :addresses addresses}))
+                            (.catch (fn [_] {:host host :addresses []}))))
+                      hosts)))
+      (.then (fn [results]
+               (let [results (js->clj results :keywordize-keys true)
+                     all-addresses (->> results (mapcat :addresses) distinct sort vec)
+                     addresses (vec (take 4096 all-addresses))
+                     complete? (and (seq hosts)
+                                    (<= (count all-addresses) 4096)
+                                    (every? #(seq (:addresses %)) results))]
+                 {:ready (boolean complete?)
+                  :addresses addresses
+                  :host-addresses (into {} (map (juxt :host :addresses)) results)
+                  :unresolved (->> results
+                                   (keep (fn [{:keys [host addresses]}]
+                                           (when-not (seq addresses) host)))
+                                   vec)})))))
+
 (defn- consume!
   [buffer on-packet]
   (loop [offset 0]
@@ -22,7 +116,7 @@
       (let [length (.readUInt32BE buffer offset)
             end (+ offset 4 length)]
         (cond
-          (or (zero? length) (> length packet/max-packet-bytes))
+          (or (zero? length) (> length max-bridge-frame-bytes))
           (throw (js/Error. "invalid TUN packet length"))
 
           (> end (.-length buffer))
@@ -41,90 +135,222 @@
         (throw (js/Error. "packet bridge path exists and is not a socket")))
       (.unlinkSync fs socket-path))))
 
-(defn start
-  [{:keys [config on-event]
-    :or {on-event (fn [event] (println (pr-str event)))}}]
-  (let [socket-path (get-in config [:packet-bridge :path])
-        client (atom nil)
-        handle (atom nil)
-        emit (fn [event] (on-event event))
-        agent-event
-        (fn [event]
-          (if (and (= :data (:event event))
-                   (packet/unframe (:payload event)))
-            (let [decoded (packet/unframe (:payload event))
-                  state (some-> @handle :state deref)]
-              (if (and state
-                       (packet/inbound-authorized?
-                        (:netmap state) (:peer event))
-                       @client)
-                (write-packet! @client (:packet/bytes decoded))
-                (emit {:event :packet-dropped :peer (:peer event)
-                       :reason :unauthorized-or-no-tun})))
-            (emit event)))]
+(defn prepare
+  "Validate the local packet bridge path and remove only a stale socket entry.
+  Call before starting the agent so a bad path cannot leave a live agent behind."
+  [config]
+  (let [socket-path (get-in config [:packet-bridge :path])]
     (when-not (seq socket-path)
       (throw (js/Error. "packet-bridge :path is required")))
     (prepare-socket-path! socket-path)
+    socket-path))
+
+(defn event-handler
+  "Create the agent's packet callback for a shared Kekkai runtime."
+  ([handle-ref client emit]
+   (event-handler handle-ref client emit (atom (fn [_] nil))))
+  ([handle-ref client emit refresh-underlay]
+   (fn [event]
+    (cond
+      (and (= :data (:event event))
+           (packet/unframe (:payload event)))
+      (let [decoded (packet/unframe (:payload event))
+            state (some-> @handle-ref :state deref)]
+        (if (and state
+                 (packet/inbound-authorized? (:netmap state) (:peer event))
+                 @client)
+          (write-packet! @client (:packet/bytes decoded))
+          (emit {:event :packet-dropped :peer (:peer event)
+                 :reason :unauthorized-or-no-tun})))
+
+      (= :underlay-candidates-changed (:event event))
+      (do (js/setTimeout #(@refresh-underlay false) 0) (emit event))
+
+      (contains? #{:reflexive :netmap-updated} (:event event))
+      (do (js/setTimeout #(@refresh-underlay false) 0) (emit event))
+
+      :else (emit event)))))
+
+(defn attach
+  "Attach the local framed packet socket to an already-running agent. Returns
+  a component handle whose :stop closes only this bridge, not the shared agent."
+  ([agent-handle config client emit]
+   (attach agent-handle config client emit (atom (fn [_] nil))))
+  ([agent-handle config client emit refresh-ref]
+   (let [socket-path (prepare config)
+        last-hosts (atom nil)
+        last-resolution-at (atom 0)
+        host-addresses (atom {})
+        last-routes (atom nil)
+        underlay-guard (atom nil)
+        refresh-underlay
+          (fn [force?]
+            (let [state @(:state agent-handle)
+                  hosts (underlay-hosts state)
+                  routes (packet/authorized-routes (:netmap state)
+                                                   (agent/now-s))
+                  now (.now js/Date)
+                  changed? (not= hosts @last-hosts)
+                  routes-changed? (not= routes @last-routes)
+                  refresh-dns? (>= (- now @last-resolution-at) 60000)]
+              (when (and @client @underlay-guard
+                         (or force? changed? routes-changed? refresh-dns?))
+                ;; A changed DNS answer or peer candidate invalidates the old
+                ;; host-to-route proof until the extension acknowledges the
+                ;; refreshed exclusions.
+                (udp/allow-underlay-hosts!
+                 (get @(:state agent-handle) :sock) [] {})
+                (reset! last-hosts hosts)
+                (reset! last-routes routes)
+                (reset! last-resolution-at now)
+                (-> (resolve-underlay hosts)
+                    (.then (fn [snapshot]
+                             (when @client
+                               (let [snapshot (assoc snapshot :routes
+                                                     (mapv (fn [route]
+                                                             {:family (:route/family route)
+                                                              :prefix (:route/prefix route)
+                                                              :bits (:route/bits route)})
+                                                           routes))]
+                               (udp/allow-underlay-hosts!
+                                (get @(:state agent-handle) :sock) [] {})
+                               (reset! host-addresses (:host-addresses snapshot))
+                               (write-underlay! @client
+                                                (select-keys snapshot
+                                                             [:ready :addresses :routes
+                                                              :unresolved]))
+                               (emit {:event :underlay-routes-published
+                                      :ready (:ready snapshot)
+                                      :address-count (count (:addresses snapshot))
+                                      :route-count (count routes)
+                                      :unresolved (:unresolved snapshot)})))))
+                    (.catch (fn [error]
+                              (when @client
+                                 (write-underlay! @client
+                                                 {:ready false :addresses []
+                                                  :routes (mapv (fn [route]
+                                                                  {:family (:route/family route)
+                                                                   :prefix (:route/prefix route)
+                                                                   :bits (:route/bits route)})
+                                                                routes)
+                                                  :unresolved hosts})
+                                (emit {:event :underlay-routes-error
+                                       :reason (ex-message error)}))))))))
+        _ (reset! refresh-ref refresh-underlay)
+        refresh-timer (js/setInterval #(refresh-underlay false) 1000)
+        server
+          (.createServer
+           net
+           (fn [socket]
+             (if @client
+               (.destroy socket (js/Error. "packet bridge already connected"))
+               (let [buffer (atom (.alloc js/Buffer 0))]
+                 (reset! client socket)
+                 (emit {:event :packet-bridge-connected})
+                 (.on socket "data"
+                      (fn [chunk]
+                        (try
+                          (swap! buffer
+                                 (fn [current]
+                                   (consume!
+                                    (.concat js/Buffer #js [current chunk])
+                                    (fn [bytes]
+                                      (case (frame-type bytes)
+                                        2 (let [addresses (set (:addresses
+                                                               (control-json bytes)))
+                                                hosts (->> @host-addresses
+                                                           (keep (fn [[host resolved]]
+                                                                   (when (and (seq resolved)
+                                                                              (every? addresses resolved))
+                                                                     host)))
+                                                           vec)]
+                                            (when-let [guard @underlay-guard]
+                                              (udp/allow-underlay-hosts!
+                                               (get @(:state agent-handle) :sock) hosts
+                                               (select-keys @host-addresses hosts)))
+                                            (emit {:event :underlay-routes-acknowledged
+                                                   :address-count (count addresses)
+                                                   :host-count (count hosts)}))
+
+                                        3 (do
+                                            (reset! underlay-guard
+                                                    (udp/guard-underlay!
+                                                     (get @(:state agent-handle) :sock)))
+                                            (emit {:event :underlay-guard-enabled})
+                                            (refresh-underlay true))
+
+                                        4 (do
+                                            (udp/clear-underlay-guard!
+                                             (get @(:state agent-handle) :sock))
+                                            (reset! underlay-guard nil)
+                                            (emit {:event :underlay-guard-released}))
+
+                                        (if-let [parsed (packet/parse bytes)]
+                                          (let [state @(:state agent-handle)
+                                                peer (packet/route-peer
+                                                      (:netmap state) parsed
+                                                      (agent/now-s))]
+                                            (if peer
+                                              (swap! (:state agent-handle)
+                                                     agent/send-to peer
+                                                     (packet/frame
+                                                      (:packet/bytes parsed)))
+                                              (emit {:event :packet-dropped
+                                                     :reason :no-signed-route})))
+                                          (emit {:event :packet-dropped
+                                                 :reason :malformed-ip})))))))
+                          (catch :default error
+                            (emit {:event :packet-bridge-error
+                                   :reason (ex-message error)})
+                            (.destroy socket)))))
+                 (.on socket "close"
+                      #(when (= socket @client)
+                         (reset! client nil)
+                         (emit {:event :packet-bridge-disconnected})))))))]
+    (.listen server socket-path
+             (fn []
+               (try
+                 ;; The bridge can emit raw packets under this node's signed
+                 ;; route authority. Keep it private to the node owner; on
+                 ;; macOS the privileged Network Extension can still connect.
+                 (when-not (= "win32" (.-platform js/process))
+                   (.chmodSync fs socket-path 0x180))
+                 (emit {:event :packet-bridge-listening :path socket-path})
+                 (catch :default error
+                   (emit {:event :packet-bridge-error
+                          :reason (ex-message error)})
+                   (.close server)))))
+    {:packet-server server
+     :stop (fn []
+             (js/clearInterval refresh-timer)
+             (when-let [socket @client] (.destroy socket))
+             (.close server)
+             (when (and (not= "win32" (.-platform js/process))
+                        (.existsSync fs socket-path)
+                        (.isSocket (.lstatSync fs socket-path)))
+               (.unlinkSync fs socket-path)))})))
+
+(defn start
+  [{:keys [config on-event]
+    :or {on-event agent/log-event}}]
+  (let [_ (prepare config)
+        client (atom nil)
+        handle-ref (atom nil)
+        emit (fn [event] (on-event event))
+        ;; The callback is installed by attach after start resolves; lifecycle
+        ;; events before that point have no connected local socket to update.
+        refresh-ref (atom (fn [_] nil))
+        agent-event (event-handler handle-ref client emit refresh-ref)]
     (-> (agent/start {:config config :on-event agent-event})
         (.then
          (fn [agent-handle]
-           (reset! handle agent-handle)
-           (let [server
-                 (.createServer
-                  net
-                  (fn [socket]
-                    (if @client
-                      (.destroy socket (js/Error. "packet bridge already connected"))
-                      (let [buffer (atom (.alloc js/Buffer 0))]
-                        (reset! client socket)
-                        (emit {:event :packet-bridge-connected})
-                        (.on socket "data"
-                             (fn [chunk]
-                               (try
-                                 (swap! buffer
-                                        (fn [current]
-                                          (consume!
-                                           (.concat js/Buffer
-                                                    #js [current chunk])
-                                           (fn [bytes]
-                                             (if-let [parsed (packet/parse bytes)]
-                                               (let [state @(:state agent-handle)
-                                                     peer
-                                                     (packet/route-peer
-                                                      (:netmap state) parsed
-                                                      (agent/now-s))]
-                                                 (if peer
-                                                   (swap! (:state agent-handle)
-                                                          agent/send-to peer
-                                                          (packet/frame
-                                                           (:packet/bytes parsed)))
-                                                   (emit
-                                                    {:event :packet-dropped
-                                                     :reason :no-signed-route})))
-                                               (emit {:event :packet-dropped
-                                                      :reason :malformed-ip}))))))
-                                 (catch :default error
-                                   (emit {:event :packet-bridge-error
-                                          :reason (ex-message error)})
-                                   (.destroy socket)))))
-                        (.on socket "close"
-                             #(when (= socket @client)
-                                (reset! client nil)
-                                (emit {:event :packet-bridge-disconnected})))))))]
-             (.listen server socket-path
-                      #(emit {:event :packet-bridge-listening
-                              :path socket-path}))
+           (reset! handle-ref agent-handle)
+           (let [component (attach agent-handle config client emit refresh-ref)]
              (assoc agent-handle
-                    :packet-server server
-                    :stop
-                    (fn []
-                      (when-let [socket @client] (.destroy socket))
-                      (.close server)
-                      ((:stop agent-handle))
-                      (when (and (not= "win32" (.-platform js/process))
-                                 (.existsSync fs socket-path)
-                                 (.isSocket (.lstatSync fs socket-path)))
-                        (.unlinkSync fs socket-path))))))))))
+                    :packet-server (:packet-server component)
+                    :stop (fn []
+                            ((:stop component))
+                            ((:stop agent-handle))))))))))
 
 (defn -main [& args]
   (let [path (or (first args) "kekkai-tun-agent.edn")

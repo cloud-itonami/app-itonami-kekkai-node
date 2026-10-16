@@ -1,0 +1,483 @@
+(ns kekkai.node.netmap-watch
+  "Pull and verify a per-node Kekkai desired-state netmap from independent
+  local or SSH mirrors, then atomically update the resident agent's file."
+  (:require [cljs.reader :as edn]
+            [clojure.string :as string]
+            [ipns.core :as ipns]
+            [kekkai.node.heartbeat :as node-heartbeat]
+            [kekkai.node.signed-netmap :as signed-netmap]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:path" :as path]
+            ["node:child_process" :as child-process]))
+
+(def missing-marker "__KEKKAI_DESIRED_STATE_MISSING__")
+(def schema "kekkai.desired-state/v1")
+(def kind :kekkai/netmap)
+(def max-read-bytes (* 16 1024 1024))
+(def raw-cid-pattern #"b[a-z2-7]{58}")
+
+(defn- buffer [value encoding]
+  (.from js/Buffer value encoding))
+
+(defn- b64 [value]
+  (.toString value "base64"))
+
+(defn- unb64 [value]
+  (buffer value "base64"))
+
+(defn- base32 [bytes]
+  (let [alphabet "abcdefghijklmnopqrstuvwxyz234567"]
+    (loop [remaining (seq bytes) accumulator 0 bits 0 output []]
+      (cond
+        (>= bits 5)
+        (let [left (- bits 5)
+              digit (bit-and (bit-shift-right accumulator left) 31)
+              mask (dec (bit-shift-left 1 left))]
+          (recur remaining (bit-and accumulator mask) left
+                 (conj output (.charAt alphabet digit))))
+
+        (seq remaining)
+        (recur (next remaining)
+               (bit-or (bit-shift-left accumulator 8)
+                       (bit-and (first remaining) 255))
+               (+ bits 8) output)
+
+        (pos? bits)
+        (apply str (conj output
+                         (.charAt alphabet
+                                  (bit-and (bit-shift-left accumulator (- 5 bits)) 31))))
+
+        :else (apply str output)))))
+
+(defn cidv1-raw [bytes]
+  (let [digest (.digest (.update (.createHash crypto "sha256") bytes))]
+    (str "b" (base32 (concat [1 0x55 0x12 0x20] (array-seq digest))))))
+
+(defn- authority-material [authority-spki-b64]
+  (when-not (and (string? authority-spki-b64) (seq authority-spki-b64))
+    (throw (ex-info "netmap authority SPKI is required"
+                    {:type :kekkai/missing-netmap-authority})))
+  (let [der (unb64 authority-spki-b64)
+        public-key (.createPublicKey crypto
+                                     #js {:key der :format "der" :type "spki"})
+        raw (.subarray der (- (.-length der) 32))]
+    {:public-key public-key
+     :authority-spki-b64 authority-spki-b64
+     :graph (ipns/pubkey->name (vec (array-seq raw)))}))
+
+(defn verify-desired-envelope
+  "Verify the signed control-plane block and return its decoded payload."
+  [envelope authority subject]
+  (let [{:desired/keys [cid statement-b64 signature-b64 signer-spki-b64]} envelope]
+    (when-not (every? string? [cid statement-b64 signature-b64 signer-spki-b64])
+      (throw (ex-info "desired-state envelope is incomplete"
+                      {:type :kekkai/invalid-desired-envelope})))
+    (when-not (= (:authority-spki-b64 authority) signer-spki-b64)
+      (throw (ex-info "desired-state signer is not the pinned authority"
+                      {:type :kekkai/untrusted-desired-signer})))
+    (let [statement-bytes (unb64 statement-b64)]
+      (when-not (= cid (cidv1-raw statement-bytes))
+        (throw (ex-info "desired-state CID mismatch"
+                        {:type :kekkai/desired-cid-mismatch})))
+      (when-not (.verify crypto nil statement-bytes (:public-key authority)
+                         (unb64 signature-b64))
+        (throw (ex-info "desired-state signature invalid"
+                        {:type :kekkai/desired-signature-invalid})))
+      (let [statement (edn/read-string (.toString statement-bytes "utf8"))
+            payload-bytes (unb64 (:desired/payload-b64 statement))
+            payload (edn/read-string (.toString payload-bytes "utf8"))]
+        (when-not (= schema (:desired/schema statement))
+          (throw (ex-info "desired-state schema mismatch"
+                          {:type :kekkai/desired-schema-mismatch})))
+        (when-not (= (:graph authority) (:desired/name statement))
+          (throw (ex-info "desired-state name is not derived from signer"
+                          {:type :kekkai/desired-name-mismatch})))
+        (when-not (= (:desired/payload-cid statement) (cidv1-raw payload-bytes))
+          (throw (ex-info "desired-state payload CID mismatch"
+                          {:type :kekkai/desired-payload-cid-mismatch})))
+        (when-not (= kind (:desired/kind statement))
+          (throw (ex-info "desired-state kind mismatch"
+                          {:type :kekkai/desired-kind-mismatch})))
+        (when-not (= subject (:desired/subject statement))
+          (throw (ex-info "desired-state subject mismatch"
+                          {:type :kekkai/desired-subject-mismatch})))
+        (when-not (and (integer? (:desired/epoch statement))
+                       (pos? (:desired/epoch statement)))
+          (throw (ex-info "desired-state epoch is invalid"
+                          {:type :kekkai/invalid-desired-epoch})))
+        (assoc statement :desired/cid cid :desired/payload payload)))))
+
+(defn- remote-root [root]
+  (when (and (string? root) (string/starts-with? root "ssh://"))
+    (let [[_ host remote-path] (re-matches #"ssh://([^/]+)(/.*)" root)]
+      (when-not (and host remote-path
+                     (re-matches #"(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+" host)
+                     (re-matches #"/[A-Za-z0-9._/-]+" remote-path)
+                     (not (string/includes? remote-path "..")))
+        (throw (ex-info "invalid SSH desired-state root"
+                        {:type :kekkai/invalid-ssh-mirror :root root})))
+      {:host host :path (string/replace remote-path #"/+$" "")})))
+
+(defn- remote-read [host command]
+  (.toString (.execFileSync child-process "ssh" #js [host command]
+                            #js {:encoding "buffer" :maxBuffer max-read-bytes})
+             "utf8"))
+
+(defn- read-root [root relative]
+  (if-let [{:keys [host path]} (remote-root root)]
+    (let [target (str path "/" relative)
+          text (remote-read host
+                            (str "if test -f " target "; then cat " target
+                                 "; else printf '" missing-marker "'; fi"))]
+      (when-not (= missing-marker text) text))
+    (let [target (path/join root relative)]
+      (when (.existsSync fs target)
+        (.readFileSync fs target "utf8")))))
+
+(defn- subject-key [subject]
+  (cidv1-raw (buffer subject "utf8")))
+
+(defn- head-path [subject]
+  (str "heads/" (subject-key subject) ".edn"))
+
+(defn- block-path [cid]
+  (when-not (and (string? cid) (re-matches raw-cid-pattern cid))
+    (throw (ex-info "desired-state head contains an invalid CID"
+                    {:type :kekkai/invalid-desired-cid})))
+  (str "blocks/" cid ".edn"))
+
+(defn- current-publication [roots subject authority]
+  (let [heads (mapv (fn [root]
+                      {:root root
+                       :head (some-> (read-root root (head-path subject))
+                                     edn/read-string)})
+                    roots)
+        available (filterv :head heads)]
+    (when (seq available)
+      (doseq [{:keys [head]} available]
+        (when-not (and (map? head)
+                       (integer? (:desired/epoch head))
+                       (pos? (:desired/epoch head))
+                       (string? (:desired/cid head))
+                       (= subject (:desired/subject head))
+                       (= (:graph authority) (:desired/name head)))
+          (throw (ex-info "desired-state mirror head is malformed"
+                          {:type :kekkai/invalid-desired-head}))))
+      (let [epoch (apply max (map #(get-in % [:head :desired/epoch]) available))
+            latest (filterv #(= epoch (get-in % [:head :desired/epoch])) available)
+            cids (set (map #(get-in % [:head :desired/cid]) latest))]
+        (when-not (= 1 (count cids))
+          (throw (ex-info "desired-state mirrors disagree at the same epoch"
+                          {:type :kekkai/desired-split-brain :epoch epoch :cids cids})))
+        (let [cid (first cids)
+              envelope (some (fn [{:keys [root]}]
+                               (some-> (read-root root (block-path cid))
+                                       edn/read-string))
+                             latest)]
+          (when-not envelope
+            (throw (ex-info "desired-state head has no readable block"
+                            {:type :kekkai/desired-block-unavailable :cid cid})))
+          (let [statement (verify-desired-envelope envelope authority subject)]
+            (when-not (and (= cid (:desired/cid statement))
+                           (= epoch (:desired/epoch statement)))
+              (throw (ex-info "desired-state head does not match its signed block"
+                              {:type :kekkai/desired-head-block-mismatch})))
+            (let [node-envelope (:desired/payload statement)
+                  node-map (signed-netmap/verify-envelope
+                            (pr-str node-envelope)
+                            (:authority-spki-b64 authority))]
+              (assoc statement :node-envelope node-envelope :netmap node-map))))))))
+
+(defn pull-netmap
+  "Read and authenticate the latest signed netmap for one desired-state subject."
+  [roots subject authority-spki-b64]
+  (current-publication roots subject (authority-material authority-spki-b64)))
+
+(defn- verify-http-publication [response subject authority]
+  (let [head (:desired/head response)
+        envelope (:desired/envelope response)
+        statement (verify-desired-envelope envelope authority subject)]
+    (when-not (and (map? head)
+                   (= subject (:desired/subject head))
+                   (= (:graph authority) (:desired/name head))
+                   (= (:desired/cid statement) (:desired/cid head))
+                   (= (:desired/epoch statement) (:desired/epoch head)))
+      (throw (ex-info "netmap HTTP head does not match its signed block"
+                      {:type :kekkai/desired-head-block-mismatch})))
+    (let [node-envelope (:desired/payload statement)
+          node-map (signed-netmap/verify-envelope
+                    (pr-str node-envelope)
+                    (:authority-spki-b64 authority))]
+      (assoc statement :desired/envelope envelope
+                       :node-envelope node-envelope :netmap node-map))))
+
+(defn- local-http-host? [host]
+  (contains? #{"localhost" "127.0.0.1" "[::1]"} host))
+
+(defn- read-response-text! [response]
+  (let [headers (.-headers response)
+        length-text (when headers (.get headers "content-length"))
+        content-length (when (and (string? length-text)
+                                  (re-matches #"[0-9]+" length-text))
+                         (js/Number length-text))
+        body (.-body response)]
+    (when (and content-length (> content-length max-read-bytes))
+      (throw (ex-info "netmap HTTP response exceeds the read limit"
+                      {:type :kekkai/netmap-response-too-large
+                       :limit max-read-bytes})))
+    (if (and body (fn? (.-getReader body)))
+      (let [reader (.getReader body)
+            decoder (js/TextDecoder.)
+            total (atom 0)
+            parts (atom [])]
+        (letfn [(read-next []
+                  (-> (.read reader)
+                      (.then
+                       (fn [result]
+                         (if (.-done result)
+                           (str (apply str @parts) (.decode decoder))
+                           (let [chunk (.-value result)
+                                 size (.-byteLength chunk)
+                                 next-size (+ @total size)]
+                             (if (> next-size max-read-bytes)
+                               (do
+                                 (.cancel reader)
+                                 (throw
+                                  (ex-info "netmap HTTP response exceeds the read limit"
+                                           {:type :kekkai/netmap-response-too-large
+                                            :limit max-read-bytes})))
+                               (do
+                                 (reset! total next-size)
+                                 (swap! parts conj
+                                        (.decode decoder chunk #js {:stream true}))
+                                 (read-next))))))))) ]
+          (read-next)))
+      ;; Small injected response doubles may expose only text(). Production
+      ;; fetch responses use the bounded streaming branch above.
+      (-> (.text response)
+          (.then (fn [text]
+                   (when (> (.byteLength js/Buffer text "utf8") max-read-bytes)
+                     (throw (ex-info "netmap HTTP response exceeds the read limit"
+                                     {:type :kekkai/netmap-response-too-large
+                                      :limit max-read-bytes})))
+                   text))))))
+
+(defn- pull-netmap-https! [{:keys [api-url node-id heartbeat timeout-ms]
+                            :or {timeout-ms 8000}}
+                           subject authority fetch-fn]
+  (let [base (string/replace api-url #"/+$" "")
+        parsed (js/URL. api-url)
+        protocol (.-protocol parsed)
+        host (.-hostname parsed)
+        request-url (str base "/v1/nodes/"
+                         (js/encodeURIComponent node-id) "/netmap")]
+    (when-not (and (or (= "https:" protocol)
+                       (and (= "http:" protocol) (local-http-host? host)))
+                   (= (.-origin parsed) (.-origin (js/URL. request-url)))
+                   (empty? (.-username parsed))
+                   (empty? (.-password parsed))
+                   (empty? (.-search parsed))
+                   (empty? (.-hash parsed))
+                   (string? node-id)
+                   (re-matches #"[A-Za-z0-9._:-]{1,128}" node-id)
+                   (map? heartbeat) (string? (:did heartbeat))
+                   (string? (:seed-file heartbeat))
+                   (<= 1 timeout-ms 120000)
+                   (fn? fetch-fn))
+      (throw (ex-info "invalid authenticated netmap HTTP config"
+                      {:type :kekkai/invalid-netmap-http-config})))
+    (let [identity (node-heartbeat/load-identity! heartbeat)
+          issued-at (js/Math.floor (/ (.now js/Date) 1000))
+          signature (node-heartbeat/sign-netmap-read
+                     node-id issued-at (:seed identity))]
+      (.then (fetch-fn request-url
+                       #js {:method "GET"
+                            :headers #js {"x-kekkai-issued-at" (str issued-at)
+                                          "x-kekkai-signature" signature}
+                            ;; This request carries a signed node identity. Do
+                            ;; not forward its custom signature header on a
+                            ;; redirect to another origin.
+                            :redirect "error"
+                            :signal (js/AbortSignal.timeout timeout-ms)})
+             (fn [response]
+               (if (= 200 (.-status response))
+                 (.then (read-response-text! response)
+                        (fn [text]
+                          (verify-http-publication (edn/read-string text)
+                                                   subject authority)))
+                 (throw (ex-info "netmap HTTP endpoint rejected the request"
+                                 {:type :kekkai/netmap-http-rejected
+                                  :status (.-status response)}))))))))
+
+(defn- regular-output! [output]
+  (when (.existsSync fs output)
+    (let [stat (.lstatSync fs output)]
+      (when (or (.isSymbolicLink stat) (not (.isFile stat)))
+        (throw (ex-info "netmap output must be a regular, non-symlink file"
+                        {:type :kekkai/invalid-netmap-output}))))))
+
+(defn- atomic-write! [output text]
+  (let [parent (path/dirname output)
+        temp (str output ".tmp-" (.randomUUID crypto))]
+    (.mkdirSync fs parent #js {:recursive true :mode 448})
+    (try
+      (.writeFileSync fs temp text #js {:encoding "utf8" :mode 384 :flag "wx"})
+      (.renameSync fs temp output)
+      (catch :default error
+        (try (.unlinkSync fs temp) (catch :default _ nil))
+        (throw error)))))
+
+(defn- install-newer! [output authority node-envelope node-map]
+  (regular-output! output)
+  (let [current-envelope (when (.existsSync fs output)
+                           (edn/read-string (.readFileSync fs output "utf8")))
+        current-map (when current-envelope
+                      (signed-netmap/verify-envelope
+                       (pr-str current-envelope) authority))
+        current-version (:netmap/version current-map)
+        new-version (:netmap/version node-map)]
+    (cond
+      (nil? current-envelope)
+      (do (atomic-write! output (pr-str node-envelope)) true)
+
+      (> new-version current-version)
+      (do (atomic-write! output (pr-str node-envelope)) true)
+
+      (= new-version current-version)
+      (if (= node-envelope current-envelope)
+        false
+        (throw (ex-info "different signed netmap already occupies this version"
+                        {:type :kekkai/netmap-version-conflict
+                         :version new-version})))
+
+      :else
+      (throw (ex-info "netmap watch would roll back the installed version"
+                      {:type :kekkai/netmap-version-rollback
+                       :installed current-version :received new-version})))))
+
+(defn- install-publication! [{:keys [subject authority-spki-b64 output-file]}
+                            publication]
+  (if-not publication
+    {:status :unavailable :subject subject}
+    (let [updated? (install-newer! output-file authority-spki-b64
+                                   (:node-envelope publication)
+                                   (:netmap publication))]
+      {:status (if updated? :installed :unchanged)
+       :subject subject
+       :desired/cid (:desired/cid publication)
+       :desired/epoch (:desired/epoch publication)
+       :netmap/version (:netmap/version (:netmap publication))
+       :output-file output-file})))
+
+(defn install-current! [{:keys [roots api-url subject authority-spki-b64 fetch-fn]
+                         :as config}]
+  (let [authority (authority-material authority-spki-b64)]
+    (if api-url
+      (.then (pull-netmap-https! config subject authority (or fetch-fn js/fetch))
+             #(install-publication! config %))
+      (install-publication! config
+                            (pull-netmap roots subject authority-spki-b64)))))
+
+(defn validate-config! [config]
+  (let [https-config? (and (string? (:api-url config))
+                           (string? (:node-id config))
+                           (map? (:heartbeat config))
+                           (string? (get-in config [:heartbeat :did]))
+                           (string? (get-in config [:heartbeat :seed-file])))
+        mirror-config? (and (vector? (:roots config)) (seq (:roots config)))]
+    (when-not (and (map? config) (or https-config? mirror-config?)
+                   (string? (:subject config))
+                   (string? (:authority-spki-b64 config))
+                   (string? (:output-file config)))
+      (throw (ex-info "netmap watcher config is incomplete"
+                      {:type :kekkai/invalid-netmap-watch-config})))
+    config))
+
+(defn- read-config! [config-file]
+  (when-not (and (string? config-file) (.existsSync fs config-file))
+    (throw (ex-info "netmap watcher config is missing"
+                    {:type :kekkai/missing-netmap-watch-config})))
+  (let [stat (.lstatSync fs config-file)]
+    (when (or (.isSymbolicLink stat) (not (.isFile stat)))
+      (throw (ex-info "netmap watcher config must be a regular file"
+                      {:type :kekkai/invalid-netmap-watch-config}))))
+  (validate-config! (edn/read-string (.readFileSync fs config-file "utf8"))))
+
+(defn run-once! [config-file]
+  (let [config (read-config! config-file)]
+    (install-current! config)))
+
+(defn start!
+  "Start a cancellable, serialized signed-netmap poller from config data.
+
+  `on-event` receives installed/unavailable results and one error event per
+  distinct failure. Slow HTTP reads never overlap subsequent polls."
+  ([config] (start! config (fn [_] nil)))
+  ([config on-event]
+   (let [config (validate-config! config)
+         poll-ms (or (:poll-ms config) 5000)
+         running? (atom true)
+         timer (atom nil)
+         last-error (atom nil)]
+     (when-not (and (integer? poll-ms) (<= 250 poll-ms 3600000))
+       (throw (ex-info "netmap watcher :poll-ms must be in 250..3600000"
+                       {:type :kekkai/invalid-netmap-watch-poll-interval})))
+     (letfn [(poll! []
+               (when @running?
+                 (-> (js/Promise.resolve)
+                     (.then (fn [_] (install-current! config)))
+                     (.then (fn [result]
+                              (reset! last-error nil)
+                              (when @running?
+                                (on-event (assoc result :event :netmap-watch-result)))))
+                     (.catch (fn [error]
+                               (let [message (or (ex-message error)
+                                                 "netmap watch failed")]
+                                 (when (and @running? (not= message @last-error))
+                                   (on-event {:event :netmap-watch-error
+                                              :reason message}))
+                                 (reset! last-error message))))
+                     (.then (fn [_]
+                              (when @running?
+                                (reset! timer (js/setTimeout poll! poll-ms))))))))]
+       (poll!)
+       {:stop (fn []
+                (reset! running? false)
+                (when-let [scheduled @timer]
+                  (js/clearTimeout scheduled)
+                  (reset! timer nil)))}))))
+
+(defn watch! [config-file]
+  (let [config (read-config! config-file)
+        watcher (start! config #(println (pr-str %)))
+        stop! (fn []
+                ((:stop watcher))
+                (.exit js/process 0))]
+    (println (pr-str {:event :netmap-watch-started
+                      :subject (:subject config)
+                      :output-file (:output-file config)
+                      :poll-ms (or (:poll-ms config) 5000)}))
+    (.on js/process "SIGINT" stop!)
+    (.on js/process "SIGTERM" stop!)
+    watcher))
+
+(defn -main [& args]
+  (let [[config-file mode] args]
+    (when-not config-file
+      (throw (ex-info "usage: kekkai.node.netmap-watch CONFIG.edn [--watch]"
+                      {:type :kekkai/invalid-cli-arguments})))
+    (case mode
+      nil (let [result (run-once! config-file)]
+            (if (instance? js/Promise result)
+              (-> result
+                  (.then (fn [value]
+                           (println (pr-str (assoc value
+                                                   :event :netmap-watch-result)))))
+                  (.catch (fn [error]
+                            (js/console.error (or (ex-message error) error))
+                            (set! (.-exitCode js/process) 1))))
+              (println (pr-str (assoc result :event :netmap-watch-result)))))
+      "--watch" (watch! config-file)
+      (throw (ex-info "usage: kekkai.node.netmap-watch CONFIG.edn [--watch]"
+                      {:type :kekkai/invalid-cli-arguments :mode mode})))))

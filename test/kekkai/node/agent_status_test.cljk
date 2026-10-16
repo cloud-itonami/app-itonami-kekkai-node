@@ -1,0 +1,32 @@
+(ns kekkai.node.agent-status-test
+  (:require [kotoba.test :refer [deftest is]]
+            [kotoba.turn.stun :as codec]
+            [kekkai.node.agent :as agent]))
+
+(deftest status-exposes-nat-discovery-and-peer-path-diagnostics
+  (let [nat {:status :complete
+             :candidates ["198.51.100.42:43123"]
+             :servers-answered 2
+             :symmetric? false}
+        status (agent/status {:self-id "node-a"
+                              :netmap {:netmap/version 4}
+                              :relay nil
+                              :relay-pool []
+                              :local-candidates ["198.51.100.42:43123"]
+                              :nat nat
+                              :peers {}
+                              :denied []})]
+    (is (= nat (:nat status)))
+    (is (= 4 (:netmap-version status)))
+    (is (empty? (:peers status)))))
+
+(deftest valid-stun-responses-are-not-logged-as-unrecognized-peer-datagrams
+  (let [message (codec/encode-header {:typ codec/binding-response
+                                      :length 0
+                                      :txid (vec (repeat 12 0))})
+        events (atom [])
+        state {:peers {} :by-key {}}
+        result (agent/on-datagram state message "198.51.100.1:3478"
+                                  #(swap! events conj %))]
+    (is (= state result))
+    (is (empty? @events))))

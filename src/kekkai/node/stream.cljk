@@ -8,9 +8,9 @@
   retry for the *handshake* and no sequence numbers, no acknowledgement and no
   retransmission for data. That is the right shape for a packet overlay — a
   WireGuard-equivalent hands datagrams to an IP stack and lets the inner TCP
-  provide reliability. But `kekkai-node` has no L3/TUN plane (its README is
-  explicit: `:node/overlay-ip` names peers for MagicDNS, it does not route
-  packets), and the macOS full-tunnel path is a signed Network Extension.
+  provide reliability. Kekkai now has a packet bridge that carries raw IP
+  through signed routes; platform-native VPN installation remains
+  platform-specific.
 
   So carrying `ssh` over this overlay means forwarding a TCP stream in
   userspace, and there is no inner TCP to borrow reliability from. Everything

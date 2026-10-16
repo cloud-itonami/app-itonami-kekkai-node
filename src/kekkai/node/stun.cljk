@@ -3,8 +3,9 @@
   appear to come from, i.e. our NAT's outside mapping. That answer is the
   candidate a hole punch actually uses.
 
-  The STUN codec itself is [`org-ietf-turn`](https://github.com/kotoba-lang/org-ietf-turn)'s
-  (`kotoba.turn.stun`, RFC 8489) — this namespace only puts a socket under it.
+  The STUN wire codec is [`org-ietf-turn`](https://github.com/kotoba-lang/org-ietf-turn)'s
+  (`kotoba.turn.stun`, RFC 8489). This namespace puts a socket under it and
+  decodes IPv4 and IPv6 XOR-MAPPED-ADDRESS attributes into peer candidates.
 
   One caveat that decides how much to trust the result: behind a **symmetric**
   NAT the mapping is per destination, so the address the STUN server saw is not
@@ -13,54 +14,142 @@
   `kekkai.node.disco` treats every candidate as a hypothesis to probe. If two
   peers are both symmetric, no candidate exchange can work and the relay is the
   answer — see `disco`'s docstring."
-  (:require [kotoba.lang.text] [kekkai.node.udp :as udp]
+  (:require [kotoba.lang.text :as str] [kekkai.node.udp :as udp]
+            ["node:net" :as net]
             [kotoba.turn.stun :as stun]))
 
 (defn- binding-request [tx-id]
-  (stun/encode-header stun/binding-request 0 tx-id))
+  (stun/encode-header {:typ stun/binding-request :length 0 :txid tx-id}))
+
+(defn valid-message?
+  "True for a complete STUN message with the RFC magic cookie. The shared UDP
+   socket's data-plane dispatcher uses this to avoid treating STUN replies as
+   malformed Kekkai peer datagrams."
+  [msg]
+  (try
+    (let [{:keys [length]} (stun/decode-header msg)]
+      (= (+ 20 length) (count msg)))
+    (catch :default _ false)))
 
 (defn- random-tx-id []
   ;; 96-bit transaction id (RFC 8489 §5). Random here is the right call — unlike
   ;; disco's tx-ids, this one is a defence against off-path response spoofing.
   (vec (js/Array.from (.getRandomValues js/crypto (js/Uint8Array. 12)))))
 
+(defn- decode-xor-mapped-address [value tx-id]
+  (let [value (vec value)
+        family (when (> (count value) 1) (nth value 1))
+        port (when (>= (count value) 4)
+               (bit-xor (+ (* (nth value 2) 256) (nth value 3)) 0x2112))]
+    (cond
+      (and (= family 0x01) (= (count value) 8))
+      (let [{:keys [ip]} (stun/decode-xor-mapped-v4 value)]
+        {:host (str/join "." ip) :port port})
+
+      (and (= family 0x02) (= (count value) 20) (= 12 (count tx-id)))
+      (let [mask (into [0x21 0x12 0xa4 0x42] tx-id)
+            ip (mapv bit-xor (subvec value 4 20) mask)
+            groups (map (fn [[hi lo]]
+                          (.toString (+ (* hi 256) lo) 16))
+                        (partition 2 ip))]
+        {:host (str/join ":" groups) :port port})
+
+      :else nil)))
+
 (defn reflexive
   "-> Promise of `\"host:port\"` (our mapped address) or nil on timeout.
    Uses `sock` if given, so the reflexive candidate is measured **on the same
    socket the data plane uses** — measuring on a fresh socket would report a
    different NAT mapping and publish a candidate that cannot receive anything."
-  [{:keys [server sock timeout-ms] :or {timeout-ms 2000}}]
+  [{:keys [server family sock timeout-ms] :or {timeout-ms 5000}}]
   (js/Promise.
-   (fn [resolve _reject]
+   (fn [resolve reject]
      (let [tx-id (random-tx-id)
            done (atom false)
-           finish (fn [v] (when-not @done (reset! done true) (resolve v)))
+           timer (atom nil)
+           listener (atom nil)
+           cleanup (fn []
+                     (when-let [id @timer]
+                       (js/clearTimeout id)
+                       (reset! timer nil))
+                     (when-let [f @listener]
+                       (.removeListener sock "message" f)
+                       (reset! listener nil)))
+           finish (fn [v]
+                    (when-not @done
+                      (reset! done true)
+                      (cleanup)
+                      (resolve v)))
            handler (fn [msg _from]
                      (try
-                       (let [{:keys [type transaction-id]} (stun/decode-header msg)]
-                         (when (and (= stun/binding-response type)
-                                    (= (vec transaction-id) tx-id))
-                           (let [attrs (stun/attributes msg)
-                                 xma (some (fn [{:keys [type value]}]
-                                             (when (= stun/attr-xor-mapped-address type) value))
+                       (let [{:keys [typ txid]} (stun/decode-header msg)]
+                         (when (and (= stun/binding-response typ)
+                                    (= (vec txid) tx-id))
+                           (let [attrs (stun/attributes (subvec (vec msg) 20))
+                                 xma (some (fn [[attr-type value]]
+                                             (when (= stun/attr-xor-mapped-address attr-type) value))
                                            attrs)]
                              (when xma
-                               (let [{:keys [ip port]} (stun/decode-xor-mapped-v4 xma)]
-                                 (finish (str (kotoba.lang.text/join "." ip) ":" port)))))))
-                       (catch :default _ nil)))]
-       (.on sock "message" (fn [msg rinfo] (handler (udp/->vec msg) (udp/addr->str rinfo))))
-       (udp/send! sock (binding-request tx-id) server)
-       (js/setTimeout #(finish nil) timeout-ms)))))
+                               (when-let [{:keys [host port]}
+                                          (decode-xor-mapped-address xma txid)]
+                                 (finish (if (str/includes? host ":")
+                                           (str "[" host "]:" port)
+                                           (str host ":" port))))))))
+                       (catch :default _ nil)))
+           on-message (fn [msg rinfo]
+                        (handler (udp/->vec msg) (udp/addr->str rinfo)))]
+       (reset! listener on-message)
+       (.on sock "message" on-message)
+       (reset! timer (js/setTimeout #(finish nil) timeout-ms))
+       (try
+         (if (contains? #{4 6} family)
+           (udp/send-family! sock (binding-request tx-id) server family)
+           (udp/send! sock (binding-request tx-id) server))
+         (catch :default e
+           (when-not @done
+             (reset! done true)
+             (cleanup)
+             (reject e))))))))
+
+(defn- server-family-targets [server]
+  (let [[host _] (udp/parse-addr server)]
+    (-> (udp/resolve-host-addresses host)
+        (.then (fn [addresses]
+                 (mapv (fn [family] {:server server :family family})
+                       (sort (distinct (map #(.isIP net %) addresses))))))
+        (.catch (fn [_] [])))))
+
+(defn- symmetric-mapping? [answers]
+  (let [classifiable (keep (fn [[_ family-answers]]
+                             (when (>= (count (distinct (map :server family-answers))) 2)
+                               (> (count (distinct (map :candidate family-answers))) 1)))
+                           (group-by :family answers))]
+    (when (seq classifiable)
+      (boolean (some true? classifiable)))))
 
 (defn candidates
-  "Ask several STUN servers and keep the distinct answers. More than one answer
-   means the NAT is mapping per destination (symmetric) — worth knowing, and
-   reported rather than hidden, because it predicts that hole punching will fail
-   for this node."
+  "Probe each STUN server's available address families on the shared UDP socket.
+   Compare mappings only within a family: IPv4 and IPv6 reflexive addresses are
+   expected to differ. Fewer than two answers in a family leaves that mapping
+   classification unknown."
   [{:keys [servers sock timeout-ms]}]
-  (-> (js/Promise.all (clj->js (map #(reflexive {:server % :sock sock :timeout-ms timeout-ms})
-                                    servers)))
+  (-> (js/Promise.all (clj->js (map server-family-targets servers)))
+      (.then (fn [groups]
+               (let [targets (vec (mapcat identity (array-seq groups)))]
+                 (js/Promise.all
+                  (clj->js
+                   (map (fn [{:keys [server family]}]
+                          (-> (reflexive {:server server :family family :sock sock
+                                          :timeout-ms timeout-ms})
+                              (.then (fn [candidate]
+                                       (when candidate
+                                         {:server server :family family
+                                          :candidate candidate})))))
+                        targets))))))
       (.then (fn [results]
-               (let [addrs (distinct (remove nil? (js->clj results)))]
-                 {:candidates (vec addrs)
-                  :symmetric? (> (count addrs) 1)})))))
+               (let [answers (vec (remove nil? (array-seq results)))]
+                 {:candidates (vec (distinct (map :candidate answers)))
+                  :servers-answered (count (distinct (map :server answers)))
+                  :endpoint-answers (count answers)
+                  :families-answered (vec (sort (distinct (map :family answers))))
+                  :symmetric? (symmetric-mapping? answers)})))))
