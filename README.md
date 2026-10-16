@@ -173,6 +173,8 @@ candidates and do not install routes or change the node's ACL.
 ;; /etc/kekkai/netmap-watch.edn on each resident node
 {:roots ["ssh://mirror-a/var/lib/kekkai/netmaps"
          "ssh://mirror-b/var/lib/kekkai/netmaps"]
+ :node-id "node-a"
+ :node-static-key "<local-X25519-public-key-hex>"
  :subject "default/node-a"
  :authority-spki-b64 "<pinned-authority-SPKI-base64>"
  :output-file "/run/kekkai/netmap.signed.edn"
@@ -188,6 +190,11 @@ candidates and do not install routes or change the node's ACL.
                 :subject "default/node-a"
                 :poll-ms 5000}}
 ```
+
+The standalone watcher requires `:node-id` and `:node-static-key`; the embedded
+watcher derives both from the resident agent's `:node/id` and `:static :pub`.
+Each replacement is checked against that local identity and netmap structure
+before it can replace the last good file.
 
 When a signed cache already exists, the agent starts from it and refreshes in
 the background. With no cache, it verifies and installs the current signed map
@@ -216,6 +223,7 @@ seed file as `0600` and pin the authority SPKI out of band:
 ;; standalone watcher config; the embedded watcher uses these same fields
 {:api-url "https://kekkai-control.example"
  :node-id "node-a"
+ :node-static-key "<local-X25519-public-key-hex>"
  :subject "default/node-a"
  :heartbeat {:did "did:key:z6Mk..."
              :seed-file "/etc/kekkai/node-heartbeat.seed"}

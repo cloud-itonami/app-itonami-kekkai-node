@@ -94,5 +94,28 @@
    listener. This is why the DNS server defaults to an unprivileged port —
    `port` here is what makes that work without running the agent as root."
   [{:keys [tailnet port] :or {port 5354}}]
-  {:path (str "/etc/resolver/" tailnet)
-   :content (str "nameserver 127.0.0.1\nport " port "\n")})
+  (let [port (or port 5354)]
+    (when-not (and (string? tailnet)
+                   (<= (count tailnet) 253)
+                   (every? (fn [label]
+                             (boolean (re-matches
+                                       #"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+                                       (str/lower label))))
+                           (str/split tailnet #"\.")))
+      (throw (ex-info "resolver tailnet must be a DNS suffix"
+                      {:type :kekkai/invalid-resolver-tailnet})))
+    (when-not (and (integer? port) (<= 1 port 65535))
+      (throw (ex-info "resolver port must be an integer from 1 to 65535"
+                      {:type :kekkai/invalid-resolver-port})))
+    {:path (str "/etc/resolver/" tailnet)
+     :content (str "nameserver 127.0.0.1\nport " port "\n")}))
+
+(defn resolver-action
+  "Choose the resolver-file operation without claiming files with other content.
+  A disabled DNS config removes only the exact resolver this generator writes."
+  [enabled? resolver existing-content]
+  (cond
+    (nil? resolver) :none
+    enabled? :write
+    (= (:content resolver) existing-content) :remove
+    :else :preserve))

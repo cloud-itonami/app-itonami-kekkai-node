@@ -2,7 +2,32 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-verification_root="/Users/junkawasaki/github/workspaces/codex/murakumo-kekkai-verification"
+verification_root="${KEKKAI_E2E_WORKSPACE:-${TMPDIR:-/tmp}/kekkai-node-verification}"
+if [[ -n "${KEKKAI_E2E_DEPENDENCY_CLASSPATH:-}" ]]; then
+  dependency_classpath="$KEKKAI_E2E_DEPENDENCY_CLASSPATH"
+else
+  git_common_dir="$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir)"
+  dependency_root="${KEKKAI_E2E_DEPENDENCY_ROOT:-$(dirname "$(dirname "$git_common_dir")")}"
+  dependency_classpath=""
+  missing_dependencies=()
+  for dependency in bytes noise org-ietf-dns org-ietf-turn; do
+    dependency_src="$dependency_root/$dependency/src"
+    if [[ -d "$dependency_src" ]]; then
+      dependency_classpath="${dependency_classpath:+$dependency_classpath:}$dependency_src"
+    else
+      missing_dependencies+=("$dependency_src")
+    fi
+  done
+  if [[ ${#missing_dependencies[@]} -gt 0 ]]; then
+    printf 'Missing Kekkai E2E dependency source directories:\n' >&2
+    printf '  %s\n' "${missing_dependencies[@]}" >&2
+    printf 'Set KEKKAI_E2E_DEPENDENCY_ROOT or KEKKAI_E2E_DEPENDENCY_CLASSPATH.\n' >&2
+    exit 2
+  fi
+fi
+classpath="$repo_root/src:$repo_root/test${dependency_classpath:+:$dependency_classpath}"
+backend="${KBB_BACKEND:-sci}"
+kbb_bin="${KBB_BIN:-kbb}"
 mkdir -p "$verification_root"
 e2e_dir="$(mktemp -d "$verification_root/bootstrap-ssh-e2e.XXXXXX")"
 sshd_dir="$(mktemp -d "$verification_root/bootstrap-sshd.XXXXXX")"
@@ -80,7 +105,7 @@ KEKKAI_BOOTSTRAP_E2E_DIR="$e2e_dir" \
 KEKKAI_BOOTSTRAP_SSH_PORT="$ssh_port" \
 KEKKAI_BOOTSTRAP_SSH_KEY="$ssh_key" \
 USER="$ssh_user" \
-kbb --backend sci --classpath "src:test:/Users/junkawasaki/github/kotoba-lang/bytes/src:/Users/junkawasaki/github/kotoba-lang/noise/src:/Users/junkawasaki/github/kotoba-lang/org-ietf-dns/src:/Users/junkawasaki/github/kotoba-lang/org-ietf-turn/src" \
+"$kbb_bin" --backend "$backend" --classpath "$classpath" \
   test/bootstrap_e2e.cljk; then
   cat "$sshd_dir/sshd.log"
   exit 1

@@ -46,6 +46,22 @@
     (is (= "/etc/resolver/kekkai.example" path))
     (is (= "nameserver 127.0.0.1\nport 5354\n" content))))
 
+(deftest resolver-file-rejects-paths-and-invalid-ports
+  (is (thrown? js/Error (launchd/resolver-file {:tailnet "../outside"})))
+  (is (thrown? js/Error (launchd/resolver-file {:tailnet "bad..suffix"})))
+  (is (thrown? js/Error (launchd/resolver-file {:tailnet "-bad.example"})))
+  (is (thrown? js/Error (launchd/resolver-file {:tailnet "valid.example" :port 0})))
+  (is (thrown? js/Error (launchd/resolver-file {:tailnet "valid.example" :port 65536})))
+  (is (thrown? js/Error (launchd/resolver-file {:tailnet "valid.example" :port 5354.5}))))
+
+(deftest disabling-dns-removes-only-the-generated-resolver
+  (let [resolver (launchd/resolver-file {:tailnet "kekkai.example" :port 5354})]
+    (is (= :remove (launchd/resolver-action false resolver (:content resolver))))
+    (is (= :preserve (launchd/resolver-action false resolver
+                                               "nameserver 8.8.8.8\n")))
+    (is (= :write (launchd/resolver-action true resolver nil)))
+    (is (= :none (launchd/resolver-action false nil nil)))))
+
 (deftest install-commands-are-data-not-side-effects
   (is (= [["launchctl" "bootout" "system/x"]
           ["launchctl" "bootstrap" "system" "/Library/LaunchDaemons/x.plist"]

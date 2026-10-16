@@ -102,7 +102,8 @@
           subject "default/node-a"
           output-file (path/join root "netmap.signed.edn")
           config-file (path/join root "netmap-watch.edn")
-          config {:roots roots :subject subject :output-file output-file
+          config {:roots roots :subject subject :node-id "node-a"
+                  :node-static-key "aabb" :output-file output-file
                   :authority-spki-b64 (:spki identity)}
           first-envelope (desired-envelope identity subject 1
                                            {:netmap/version 1})]
@@ -130,6 +131,35 @@
                     (catch :default error error))]
         (is (= :kekkai/netmap-version-rollback (-> error ex-data :type))))
       (is (= 2 (:netmap/version
+                (signed-netmap/verify-envelope
+                 (.readFileSync fs output-file "utf8") (:spki identity))))))))
+
+(deftest watcher-rejects-wrong-node-and-key-before-replacing-last-good-map
+  (let [root (temp-root)
+        roots [(path/join root "mirror")]
+        identity (authority)
+        subject "default/node-a"
+        output-file (path/join root "netmap.signed.edn")
+        config {:roots roots :subject subject :node-id "node-a"
+                :node-static-key "aabb" :output-file output-file
+                :authority-spki-b64 (:spki identity)}]
+    (write-publication! roots subject
+                        (desired-envelope identity subject 1 {}))
+    (is (= :installed (:status (watch/install-current! config))))
+    (doseq [[bad-self expected-type]
+            [[{:node/id "other-node" :node/key "aabb"}
+              :kekkai/netmap-self-mismatch]
+             [{:node/id "node-a" :node/key "ccdd"}
+              :kekkai/netmap-self-key-mismatch]]]
+      (write-publication! roots subject
+                          (desired-envelope identity subject 2
+                                            {:netmap/self bad-self}))
+      (let [error (try
+                    (watch/install-current! config)
+                    nil
+                    (catch :default error error))]
+        (is (= expected-type (-> error ex-data :type))))
+      (is (= 1 (:netmap/version
                 (signed-netmap/verify-envelope
                  (.readFileSync fs output-file "utf8") (:spki identity))))))))
 
@@ -165,6 +195,7 @@
           options (atom nil)
           config {:api-url "https://kekkai.example/api"
                   :node-id "node-a"
+                  :node-static-key "aabb"
                   :heartbeat heartbeat
                   :subject subject
                   :authority-spki-b64 (:spki identity)

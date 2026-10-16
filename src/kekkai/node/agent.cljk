@@ -672,6 +672,8 @@
                             (select-keys heartbeat-config [:did :seed-file]))
           watch-config (assoc watch
                               :node-id (or (:node-id watch) (:node/id config))
+                              :node-static-key (some-> (:pub (:static config))
+                                                       b/unhex b/hex)
                               :authority-spki-b64 (:netmap-authority-spki-b64 config)
                               :output-file (:netmap-file config)
                               :heartbeat read-identity)]
