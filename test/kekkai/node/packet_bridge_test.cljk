@@ -1,0 +1,25 @@
+(ns kekkai.node.packet-bridge-test
+  (:require [cljs.test :refer-macros [deftest is testing]]
+            [kekkai.node.packet-bridge :as bridge]))
+
+(deftest os-tunnel-underlay-includes-control-plane-and-ssh-mirror-hosts
+  (testing "control and discovery endpoints stay on the physical underlay"
+    (is (= ["198.51.100.8" "api.example.test" "mirror.example.test"
+            "relay.example.test" "stun.example.test"]
+           (bridge/underlay-hosts
+            {:config {:stun-servers ["stun.example.test:3478"]
+                      :underlay-exclusions []
+                      :heartbeat {:url "https://api.example.test/v1"}
+                      :netmap-watch {:api-url "https://api.example.test/netmap"
+                                     :roots ["ssh://deploy@mirror.example.test/var/lib/kekkai"]}}
+             :relay-pool [{:relay/host "relay.example.test" :relay/port 443}]
+             :peers {"peer-a" {:disco {:paths {"path-a"
+                                               {:endpoint {:host "198.51.100.8"
+                                                           :port 41641}}}}}}})))))
+
+(deftest url-underlay-host-parsing-keeps-bare-ipv6-literals
+  (is (= ["fd00::1"]
+         (bridge/underlay-hosts
+          {:config {:heartbeat {:url "https://[fd00::1]:17892/heartbeat"}}
+           :relay-pool []
+           :peers {}}))))

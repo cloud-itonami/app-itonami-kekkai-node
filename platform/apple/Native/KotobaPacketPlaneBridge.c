@@ -3,6 +3,10 @@
 
 #include <stdlib.h>
 
+#ifndef KEKKAI_KOTOBA_TARGET_PROFILE
+#define KEKKAI_KOTOBA_TARGET_PROFILE "aarch64-ios-kotoba-v1"
+#endif
+
 int64_t kekkai_packet_decide_v1(int64_t family, int64_t packet_length,
                                 int64_t mtu, int64_t route_action,
                                 int64_t transport_ready) {
@@ -10,7 +14,7 @@ int64_t kekkai_packet_decide_v1(int64_t family, int64_t packet_length,
   struct kotoba_ios_result_v1 result = {0};
   request.abi_version = KOTOBA_IOS_HOST_ABI_V1;
   request.arity = 5;
-  request.target_profile = "aarch64-ios-kotoba-v1";
+  request.target_profile = KEKKAI_KOTOBA_TARGET_PROFILE;
   request.args[0] = family;
   request.args[1] = packet_length;
   request.args[2] = mtu;

@@ -1,0 +1,64 @@
+name: KekkaiTunnel
+options:
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_STYLE: Automatic
+    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.1.0"
+targets:
+  KekkaiTunnelHost:
+    type: application
+    platform: macOS
+    sources:
+      - path: KekkaiTunnelHost
+    dependencies:
+      - target: KekkaiTunnelExtension
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: jp.kotoba.kekkai
+        PRODUCT_NAME: KekkaiTunnel
+        INFOPLIST_KEY_CFBundleDisplayName: Kekkai
+        INFOPLIST_KEY_LSUIElement: YES
+        GENERATE_INFOPLIST_FILE: YES
+        ENABLE_HARDENED_RUNTIME: YES
+        ENABLE_APP_SANDBOX: YES
+        CODE_SIGN_ENTITLEMENTS: KekkaiTunnelHost/KekkaiTunnelHost.entitlements
+  KekkaiTunnelExtension:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Sources/KekkaiTunnel
+    dependencies:
+      - sdk: Network.framework
+      - sdk: NetworkExtension.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: jp.kotoba.kekkai.tunnel
+        PRODUCT_NAME: KekkaiTunnelExtension
+        INFOPLIST_FILE: KekkaiTunnelExtension/Info.plist
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_ENTITLEMENTS: KekkaiTunnel.entitlements
+        SKIP_INSTALL: YES
+        ENABLE_APP_SANDBOX: YES
+        ENABLE_HARDENED_RUNTIME: YES
+        LIBRARY_SEARCH_PATHS:
+          - $(PROJECT_DIR)/build/packet-plane-apple
+        OTHER_LDFLAGS:
+          - $(inherited)
+          - -lKekkaiPacketPlane
+    preBuildScripts:
+      - name: Build Kotoba packet plane
+        script: |
+          "$PROJECT_DIR/../../scripts/build-apple-packet-plane.sh" \
+            "$PROJECT_DIR/build/packet-plane-apple"
+        inputFiles:
+          - $(PROJECT_DIR)/../../kotoba/kekkai/packet_plane.kotoba
+          - $(PROJECT_DIR)/../../platform/apple/Native/KotobaPacketPlaneBridge.c
+        outputFiles:
+          - $(PROJECT_DIR)/build/packet-plane-apple/libKekkaiPacketPlane.a

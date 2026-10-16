@@ -1,11 +1,18 @@
 #!/usr/bin/env kbb
 ;; Run the resident node agent.
 ;;
-;;   kbb --backend sci --classpath "src:..." bin/agent.cljk kekkai-node.edn
+;;   kbb --classpath "src:..." bin/agent.cljk kekkai-node.edn
 ;;
 ;; See README "Configuration". Prints a status line every 30s; the netmap is the
 ;; only source of who this node may talk to.
 (ns agent-main
   (:require [kekkai.node.agent :as agent]))
 
-(apply agent/-main (drop 3 (js->clj (.-argv js/process))))
+(let [argv (vec (js->clj (.-argv js/process)))
+      script-index (last (keep-indexed
+                          (fn [i arg]
+                            (when (and (string? arg) (.endsWith arg "bin/agent.cljk")) i))
+                          argv))]
+  (when-not (some? script-index)
+    (throw (js/Error. "cannot locate bin/agent.cljk in process arguments")))
+  (apply agent/-main (subvec argv (inc script-index))))

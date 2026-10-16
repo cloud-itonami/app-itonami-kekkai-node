@@ -1,0 +1,112 @@
+(ns kekkai.node.heartbeat-test
+  (:require [kotoba.test :refer [deftest is async testing]]
+            [ed25519.core :as ed25519]
+            [kekkai.node.endpoint :as endpoint]
+            [kekkai.node.heartbeat :as heartbeat]
+            [kekkai.node.heartbeat-keygen :as keygen]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+(def ^:private seed
+  (ed25519/unhex "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"))
+(def ^:private did "did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd")
+(def ^:private signature
+  "81d6948a7e939d772a27dd5323cbc639c55cd0f3c05932008b37eb9c46760b3373d48055cd134c665af64798ab262ef01cb37406c894bdab3e5d4c5df03df401")
+
+(deftest node-signature-matches-control-plane-wire-vector
+  (let [value (heartbeat/sign "node-a" 1 100000
+                              ["203.0.113.40:41641"] seed)]
+    (is (= did (ed25519/did-key-from-seed seed)))
+    (is (= signature (:heartbeat/signature-hex value)))
+    (is (= ["203.0.113.40:41641"] (:endpoints value)))))
+
+(deftest netmap-read-signature-matches-control-plane-wire-vector
+  (is (= "0f20cd15b338d04b8a7237437943f081372d401d3857a0c35f610bc7ca4289b42e1bef62f6894c775bfce41c7fdcd9df6faed881caff955be5e6d45febc43703"
+         (heartbeat/sign-netmap-read "n-server" 100000 seed))))
+
+(deftest candidate-vector-is-stable-complete-and-bounded
+  (testing "deduplicated endpoints use a stable order"
+    (is (= ["192.0.2.2:41641" "[2001:db8::1]:41642"]
+           (heartbeat/candidate-strings
+            [(endpoint/endpoint :local "192.0.2.2" 41641)
+             (endpoint/endpoint :reflexive "2001:db8::1" 41642)
+             (endpoint/endpoint :local "192.0.2.2" 41641)]))))
+  (testing "UDP and STUN wire strings remain usable heartbeat candidates"
+    (is (= ["192.0.2.2:41641" "[2001:db8::1]:41642"]
+           (heartbeat/candidate-strings
+            ["[2001:db8::1]:41642" "192.0.2.2:41641"
+             "192.0.2.2:41641"]))))
+  (testing "malformed candidates fail closed instead of publishing ':'"
+    (let [error (try (heartbeat/candidate-strings [":"])
+                     nil
+                     (catch :default error error))]
+      (is (= :kekkai/invalid-heartbeat-candidate (-> error ex-data :type)))))
+  (testing "too many candidates fail instead of silently dropping routes"
+    (let [error (try
+                  (heartbeat/candidate-strings
+                   (mapv #(endpoint/endpoint :local (str "192.0.2." (inc %)) 41641)
+                         (range 17)))
+                  nil
+                  (catch :default error error))]
+      (is (= :kekkai/too-many-heartbeat-candidates (-> error ex-data :type))))))
+
+(deftest identity-and-sequence-files-are-checked-and-persisted
+  (let [directory (.mkdtempSync fs (str (.tmpdir os) "/kekkai-heartbeat-test-"))
+        seed-file (.join path directory "node.seed")
+        sequence-file (.join path directory "heartbeat.seq")]
+    (try
+      (.writeFileSync fs seed-file (str (ed25519/hexify seed) "\n")
+                      #js {:encoding "utf8" :mode 384})
+      (.chmodSync fs seed-file 384)
+      (is (= did (:did (heartbeat/load-identity! {:seed-file seed-file :did did}))))
+      (is (= 1 (heartbeat/next-sequence! sequence-file)))
+      (is (= 2 (heartbeat/next-sequence! sequence-file)))
+      (is (= "2\n" (.readFileSync fs sequence-file "utf8")))
+      (finally (.rmSync fs directory #js {:recursive true :force true})))))
+
+(deftest heartbeat-keygen-writes-a-private-identity-once-and-returns-only-did
+  (let [directory (.mkdtempSync fs (str (.tmpdir os) "/kekkai-heartbeat-keygen-"))
+        seed-file (.join path directory "node.seed")]
+    (try
+      (let [generated (keygen/generate! seed-file)
+            content (.readFileSync fs seed-file "utf8")
+            stat (.lstatSync fs seed-file)
+            loaded (heartbeat/load-identity! generated)
+            second-run (try (keygen/generate! seed-file) nil
+                            (catch :default error error))]
+        (testing "the public did is reported but the private seed is not returned"
+          (is (string? (:did generated)))
+          (is (= #{:did :seed-file} (set (keys generated))))
+          (is (= (:did generated) (:did loaded)))
+          (is (re-matches #"(?i)[0-9a-f]{64}\n" content))
+          (is (= 384 (bit-and (.-mode stat) 511))))
+        (testing "an existing identity cannot be replaced"
+          (is (some? second-run))
+          (is (= content (.readFileSync fs seed-file "utf8")))))
+      (finally (.rmSync fs directory #js {:recursive true :force true})))))
+
+(deftest heartbeat-request-disallows-redirects
+  (async done
+    (let [directory (.mkdtempSync fs (str (.tmpdir os) "/kekkai-heartbeat-post-"))
+          sequence-file (.join path directory "heartbeat.seq")
+          options (atom nil)
+          finish (fn []
+                   (.rmSync fs directory #js {:recursive true :force true})
+                   (done))]
+      (-> (heartbeat/post!
+           {:url "https://kekkai.example/api"
+            :node-id "node-a"
+            :sequence-file sequence-file
+            :seed seed
+            :fetch-fn (fn [_request-url request-options]
+                        (reset! options request-options)
+                        (js/Promise.resolve #js {:status 202}))}
+           [])
+          (.then (fn [result]
+                   (is (:accepted? result))
+                   (is (= "error" (.-redirect @options)))
+                   (finish)))
+          (.catch (fn [error]
+                    (is false (str "heartbeat request failed: " (ex-message error)))
+                    (finish)))))))

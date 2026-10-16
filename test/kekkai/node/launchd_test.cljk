@@ -3,14 +3,18 @@
             [kotoba.test :refer [deftest is testing]]
             [kekkai.node.launchd :as launchd]))
 
-(def cfg {:label "cloud.kekkai.node" :nbb "/opt/homebrew/bin/nbb"
+(def cfg {:label "cloud.kekkai.node" :kbb "/opt/homebrew/bin/kbb"
           :classpath "src:../noise/src" :script "/opt/kekkai/bin/agent.cljk"
+          :service-user "kekkai"
           :config-file "/opt/kekkai/node.edn" :working-dir "/opt/kekkai"})
 
 (deftest plist-is-a-daemon-that-survives-logout
   (let [p (launchd/plist cfg)]
     (is (str/includes? p "<key>RunAtLoad</key>\n  <true/>"))
     (is (str/includes? p "<key>KeepAlive</key>\n  <true/>"))
+    (is (str/includes? p "<key>UserName</key>\n  <string>kekkai</string>"))
+    (is (str/includes? p (str "<key>PATH</key>\n    <string>"
+                              launchd/default-search-path "</string>")))
     (is (str/includes? p "<key>ThrottleInterval</key>"))
     (testing "installed as a system daemon, not a user agent — a LaunchAgent dies
               with the login session and does not even appear in `launchctl list`
@@ -18,9 +22,19 @@
       (is (= "/Library/LaunchDaemons/cloud.kekkai.node.plist"
              (launchd/plist-path "cloud.kekkai.node"))))
     (testing "the program arguments are the real invocation, not a shell string"
-      (is (str/includes? p "<string>/opt/homebrew/bin/nbb</string>"))
+      (is (str/includes? p "<string>/opt/homebrew/bin/kbb</string>"))
       (is (str/includes? p "<string>--classpath</string>"))
       (is (str/includes? p "<string>/opt/kekkai/node.edn</string>")))))
+
+(deftest plist-requires-a-non-root-service-user
+  (is (thrown? js/Error (launchd/plist (dissoc cfg :service-user))))
+  (is (thrown? js/Error (launchd/plist (assoc cfg :service-user "root"))))
+  (is (thrown? js/Error (launchd/plist (assoc cfg :service-user "0")))))
+
+(deftest plist-requires-a-searchable-launchd-path
+  (is (thrown? js/Error (launchd/plist (assoc cfg :launchd-path ""))))
+  (is (str/includes? (launchd/plist (assoc cfg :launchd-path "/opt/custom/bin"))
+                     "<string>/opt/custom/bin</string>")))
 
 (deftest plist-escapes-xml
   (let [p (launchd/plist (assoc cfg :classpath "a&b<c>"))]

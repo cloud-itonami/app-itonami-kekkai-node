@@ -149,6 +149,24 @@
   so the two keyspaces cannot collide."
   ::principals)
 
+(def stream-sequences-key
+  "Per-peer stream ID counters shared by every local forward on this agent."
+  ::stream-sequences)
+
+(defn- next-stream-id! [registry peer]
+  (let [state
+        (swap! registry
+               (fn [state]
+                 (let [last-id (get-in state [stream-sequences-key peer] 0)
+                       first-id (if (>= last-id stream/max-offset) 1 (inc last-id))
+                       id (loop [id first-id]
+                            (cond
+                              (not (contains? state [peer id])) id
+                              (= id stream/max-offset) (recur 1)
+                              :else (recur (inc id))))]
+                   (assoc-in state [stream-sequences-key peer] id))))]
+    (get-in state [stream-sequences-key peer])))
+
 (defn principal-of
   "Which peer opened the stream behind the loopback connection whose SOURCE
   port is `local-port`, or nil.
@@ -174,6 +192,17 @@
   expired entry would answer for somebody else's connection."
   [registry local-port]
   (get-in @registry [principals-key local-port]))
+
+(defn reset-streams!
+  "Drop every TCP stream when its authenticated peer sessions are replaced by a
+  new netmap version. Stream IDs and byte offsets belong to the old Noise
+  sessions; carrying them over would mix two policy epochs."
+  [registry]
+  (let [entries (filter (fn [[key _]] (vector? key)) @registry)]
+    (reset! registry {})
+    (doseq [[_ {:keys [socket]}] entries]
+      (when (and socket (not (.-destroyed socket)))
+        (.destroy socket)))))
 
 ;; ── inbound frames ──────────────────────────────────────────────────────────
 
@@ -296,8 +325,7 @@
   to listen on 22."
   [registry handle {:keys [listen-port peer port capability listen-host]
                     :or {capability :ssh listen-host "127.0.0.1"}}]
-  (let [next-id (atom 0)
-        server
+  (let [server
         (.createServer
          net
          (fn [socket]
@@ -308,7 +336,7 @@
                ;; Refused locally and immediately. The stream is never opened,
                ;; so a forbidden connection costs no overlay traffic.
                (.destroy socket)
-               (let [id (swap! next-id inc)
+               (let [id (next-stream-id! registry peer)
                      key [peer id]
                      {:keys [state frames]}
                      (stream/initiator {:stream-id id :capability capability
@@ -375,6 +403,49 @@
        (.listen server port "127.0.0.1"
                 #(resolve {:server server :port (.-port (.address server))}))))))
 
+(defn event-handler
+  "Create the agent callback for a shared runtime. `handle-ref` is filled after
+  the single agent starts; until then no peer session exists. An optional
+  lifecycle callback exposes bounded agent events such as relay/direct changes.
+  The combined runtime supplies its own event path to avoid duplicate logs."
+  [registry handle-ref & [on-event]]
+  (fn [event]
+    (when (= :data (:event event))
+      (when-let [handle @handle-ref]
+        (on-peer-data registry handle event)))
+    (when (= :netmap-updated (:event event))
+      (reset-streams! registry))
+    (when on-event (on-event event))))
+
+(defn attach
+  "Attach stream listeners and their retransmit timer to an already-running
+  Kekkai agent. This lets one node process serve streams and the packet bridge
+  without opening a second UDP identity/session table. Returns a component
+  handle whose :stop closes only the stream resources, not the shared agent."
+  [agent-handle config registry]
+  (let [timer (js/setInterval #(tick! registry agent-handle) tick-ms)
+        servers (mapv #(forward! registry agent-handle %)
+                      (:forwards config))]
+    (doseq [f (:forwards config)]
+      (println (str "kekkai forward 127.0.0.1:" (:listen-port f)
+                    " -> " (:peer f) ":" (:port f)
+                    " (" (name (or (:capability f) :ssh)) ")")))
+    (-> (if-let [pe (:principal-endpoint config)]
+          (principal-endpoint registry pe)
+          (js/Promise.resolve nil))
+        (.then
+         (fn [principals]
+           (when principals
+             (println (str "kekkai principal endpoint 127.0.0.1:"
+                           (:port principals))))
+           {:stream-registry registry
+            :forwarders servers
+            :principal-endpoint principals
+            :stop (fn []
+                    (js/clearInterval timer)
+                    (doseq [s servers] (.close s))
+                    (when principals (.close (:server principals))))})))))
+
 (defn start
   "Run an agent with stream forwarding attached.
 
@@ -383,37 +454,22 @@
   node opts into here, it is what the netmap already grants."
   [config]
   (let [registry (atom {})
-        handle (atom nil)
-        on-event (fn [event]
-                   (when (= :data (:event event))
-                     (on-peer-data registry @handle event)))]
+        handle-ref (atom nil)
+        on-event (event-handler registry handle-ref agent/log-event)]
     (-> (agent/start {:config config :on-event on-event})
         (.then
          (fn [agent-handle]
-           (reset! handle agent-handle)
-           (let [timer (js/setInterval #(tick! registry agent-handle) tick-ms)
-                 servers (mapv #(forward! registry agent-handle %)
-                               (:forwards config))]
-             (doseq [f (:forwards config)]
-               (println (str "kekkai forward 127.0.0.1:" (:listen-port f)
-                             " -> " (:peer f) ":" (:port f)
-                             " (" (name (or (:capability f) :ssh)) ")")))
-             (-> (if-let [pe (:principal-endpoint config)]
-                   (principal-endpoint registry pe)
-                   (js/Promise.resolve nil))
-                 (.then
-                  (fn [principals]
-                    (when principals
-                      (println (str "kekkai principal endpoint 127.0.0.1:"
-                                    (:port principals))))
-                    (assoc agent-handle
-                           :stream-registry registry
-                           :principal-endpoint principals
-                           :stop (fn []
-                                   (js/clearInterval timer)
-                                   (doseq [s servers] (.close s))
-                                   (when principals (.close (:server principals)))
-                                   ((:stop agent-handle)))))))))))))
+           (reset! handle-ref agent-handle)
+           (-> (attach agent-handle config registry)
+               (.then
+                (fn [component]
+                  (assoc agent-handle
+                         :stream-registry registry
+                         :forwarders (:forwarders component)
+                         :principal-endpoint (:principal-endpoint component)
+                         :stop (fn []
+                                 ((:stop component))
+                                 ((:stop agent-handle))))))))))))
 
 (defn -main [& args]
   (let [path (or (first args) "kekkai-node.edn")

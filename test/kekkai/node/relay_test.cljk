@@ -40,6 +40,37 @@
     (is (= #{(b/hex (:pub a)) (b/hex (:pub b))} (relay/registered-keys server))
         "the relay routes to keys the handshake proved, never to self-asserted ones")))
 
+(deftest relay-address-brackets-ipv6-hosts
+  (is (= "[2001:db8::7]:41641"
+         (relay/relay-addr {:relay/host "2001:db8::7" :relay/port 41641})))
+  (is (= "relay.example:41641"
+         (relay/relay-addr {:relay/host "relay.example" :relay/port 41641}))))
+
+(deftest application-send-does-not-suppress-relay-liveness
+  (let [{:keys [ca b]} (fixture)
+        ca (assoc-in ca [:config :keepalive-ms] 1000)
+        [sent _] (relay/client-send ca (:pub b) [1 2 3] 2000)
+        [pinged _] (relay/client-ping sent [] 2001)]
+    (is (not (relay/client-keepalive-due? sent 1999)))
+    (is (relay/client-keepalive-due? sent 2001)
+        "a local UDP send is not evidence the relay received a packet")
+    (is (not (relay/client-keepalive-due? pinged 3000)))
+    (is (relay/client-keepalive-due? pinged 3001))
+    (is (not (relay/client-keepalive-due? (assoc pinged :session nil) 5000))
+        "a timed-out relay session must re-register instead of trying to ping")))
+
+(deftest relay-registration-timeout-survives-retries
+  (let [c (relay/client {:suite suite :static (kp) :relay-key (:pub (kp))
+                         :relay-addr "relay:1" :prologue prologue
+                         :config {:hello-retry-ms 5 :handshake-timeout-ms 10}})
+        [c _] (relay/client-hello c 100)
+        [c _] (relay/client-hello c 105)]
+    (is (= 100 (:hello-started-at c))
+        "retry timestamps do not keep a dead relay in the preferred slot forever")
+    (is (not (relay/client-handshake-expired? c 109)))
+    (is (relay/client-handshake-expired? c 110))
+    (is (not (relay/client-handshake-expired? (assoc c :session {}) 200)))))
+
 (deftest a-client-that-cannot-authenticate-is-not-registered
   (testing "garbage, and a handshake aimed at the wrong relay key, both fail"
     (let [{:keys [server mk]} (fixture)
@@ -126,6 +157,47 @@
     (is (= 2 (count events)))
     (is (empty? (relay/registered-keys state)))))
 
+(deftest restarted-relay-session-is-detected-and-reregistered
+  (let [{:keys [server ca a relay-static]} (fixture)
+        timeout 2000
+        ca (assoc-in ca [:config :pong-timeout-ms] timeout)
+        [ca ping] (relay/client-ping ca [] 2000)
+        healthy-server (relay/server-on-datagram
+                        server {:from "10.0.0.1:1111" :bytes (:bytes ping) :now 2000})
+        healthy-client (relay/client-on-datagram
+                        ca {:bytes (:bytes (first (:send healthy-server))) :now 2000})
+        [stale-client _first-ping-after-restart]
+        (relay/client-ping (:state healthy-client) [] 3000)
+        [stale-client ping-after-restart]
+        (relay/client-ping stale-client [] 4000)
+        restarted (relay/server {:suite suite :static relay-static :region "test"
+                                 :prologue prologue})
+        lost (relay/server-on-datagram restarted
+                                        {:from "10.0.0.1:1111"
+                                         :bytes (:bytes ping-after-restart) :now 4000})]
+    (is (= 2000 (get-in healthy-client [:state :last-response]))
+        "an authenticated pong refreshes relay liveness")
+    (is (nil? (get-in healthy-client [:state :unanswered-ping-at]))
+        "an authenticated response clears the outstanding ping")
+    (is (= 3000 (:unanswered-ping-at stale-client))
+        "repeated pings preserve the oldest unanswered ping time")
+    (is (not (relay/client-liveness-expired? (:state healthy-client) (+ 2000 timeout))))
+    (is (empty? (:send lost)) "the restarted relay has no prior client registration")
+    (is (= :unregistered-address (get-in lost [:events 0 :reason])))
+    (is (not (relay/client-liveness-expired? stale-client (+ 3000 (dec timeout)))))
+    (is (relay/client-liveness-expired? stale-client (+ 3000 timeout)))
+    (let [[retry hello] (relay/client-reconnect stale-client (+ 3000 timeout))
+          registered (relay/server-on-datagram (:state lost)
+                                               {:from "10.0.0.1:1111"
+                                                :bytes (:bytes hello)
+                                                :now (+ 3000 timeout)})
+          response (relay/client-on-datagram
+                    retry {:bytes (:bytes (first (:send registered)))
+                           :now (+ 3000 timeout)})]
+      (is (relay/connected? (:state response)))
+      (is (= #{(b/hex (:pub a))} (relay/registered-keys (:state registered))))
+      (is (= :connected (get-in response [:events 0 :event]))))))
+
 (deftest framing-rejects-hostile-input
   (is (= :short-frame (:error (relay/decode-frame [1]))))
   (is (= :bad-magic (:error (relay/decode-frame [0 1 2 3]))))
@@ -141,4 +213,10 @@
               wins when nothing has been measured"
       (is (= "jp-tyo-1" (:relay/name (relay/home relays {"jp-tyo-1" 90}))))
       (is (= "jp-tyo-1" (:relay/name (relay/home relays {} {:prefer-region "jp"}))))
-      (is (= "us-sjc-1" (:relay/name (relay/home relays {} {:prefer-region "us"})))))))
+      (is (= "us-sjc-1" (:relay/name (relay/home relays {} {:prefer-region "us"}))))))
+  (testing "failover follows signed publication order and wraps"
+    (let [relays [{:relay/name "jp-tyo-1"} {:relay/name "us-sjc-1"}]]
+      (is (= "us-sjc-1" (:relay/name (relay/next-home relays "jp-tyo-1"))))
+      (is (= "jp-tyo-1" (:relay/name (relay/next-home relays "us-sjc-1"))))
+      (is (= "jp-tyo-1" (:relay/name (relay/next-home relays "unknown"))))
+      (is (nil? (relay/next-home [] "none"))))))

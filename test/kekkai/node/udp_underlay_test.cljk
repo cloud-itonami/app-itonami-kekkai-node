@@ -1,0 +1,112 @@
+(ns kekkai.node.udp-underlay-test
+  (:require [kotoba.test :refer [deftest is async]]
+            [kekkai.node.udp :as udp]))
+
+(deftest outgoing-datagrams-wait-for-acknowledged-underlay-routes
+  (let [sent (atom [])
+        socket #js {:send (fn [_bytes port host]
+                            (swap! sent conj {:port port :host host}))}]
+    (udp/guard-underlay! socket)
+    (udp/send! socket [1 2 3] "relay.example:3478")
+    (is (empty? @sent) "no UDP send before the extension route ACK")
+
+    (udp/allow-underlay-hosts!
+     socket ["relay.example"] {"relay.example" ["198.51.100.7"]})
+    (is (= [{:port 3478 :host "::ffff:198.51.100.7"}] @sent)
+        "the ACK releases the queued frame to its resolved numeric address")
+
+    (udp/send! socket [4 5 6] "203.0.113.8:41641")
+    (is (= 1 (count @sent)) "a newly discovered candidate is held")
+    (udp/allow-underlay-hosts!
+     socket ["relay.example" "203.0.113.8"]
+     {"relay.example" ["198.51.100.7"]
+      "203.0.113.8" ["203.0.113.8"]})
+    (is (= [{:port 3478 :host "::ffff:198.51.100.7"}
+            {:port 41641 :host "::ffff:203.0.113.8"}]
+           @sent)
+        "a candidate sends only after its updated route set is acknowledged")
+    (udp/clear-underlay-guard! socket)))
+
+(deftest family-specific-stun-sends-wait-for-route-ack-and-use-acked-family-addresses
+  (let [sent (atom [])
+        socket #js {:send (fn [_bytes port host]
+                            (swap! sent conj {:port port :host host}))}]
+    (udp/guard-underlay! socket)
+    (udp/send-family! socket [9 8 7] "stun.example:3478" 6)
+    (is (empty? @sent) "family-specific STUN probes wait for the route ACK")
+
+    (udp/allow-underlay-hosts!
+     socket ["stun.example"]
+     {"stun.example" ["198.51.100.7" "2001:db8::7"]})
+    (is (= [{:port 3478 :host "2001:db8::7"}] @sent)
+        "the queued IPv6 probe is released only to the acknowledged IPv6 route")
+    (udp/clear-underlay-guard! socket)))
+
+(deftest dual-stack-socket-roundtrips-ipv4-and-ipv6-loopback
+  (async done
+    (let [sock-ref (atom nil)
+          received (atom [])
+          timer (atom nil)]
+      (-> (udp/socket
+           {:on-message (fn [bytes from]
+                          (swap! received conj {:bytes bytes :from from})
+                          (when (= 2 (count @received))
+                            (let [port (udp/local-port @sock-ref)]
+                              (js/clearTimeout @timer)
+                              (udp/close! @sock-ref)
+                              (is (= #{{:bytes [4] :from (str "127.0.0.1:" port)}
+                                       {:bytes [6] :from (str "[::1]:" port)}}
+                                     (set @received)))
+                              (done))))})
+          (.then (fn [sock]
+                   (reset! sock-ref sock)
+                   (reset! timer (js/setTimeout
+                                  (fn []
+                                    (udp/close! sock)
+                                    (is false (str "timed out; received " @received))
+                                    (done))
+                                  2000))
+                   (udp/send! sock [4] (str "127.0.0.1:" (udp/local-port sock)))
+                   (udp/send! sock [6] (str "[::1]:" (udp/local-port sock))))
+                 (fn [error]
+                   (is false (str "dual-stack bind failed: " error))
+                   (done)))))))
+
+(deftest dual-stack-socket-resolves-hostnames-before-send
+  (async done
+    (let [sock-ref (atom nil)
+          acknowledged? (atom false)
+          timer (atom nil)
+          ack-timer (atom nil)]
+      (-> (udp/socket
+           {:on-message (fn [bytes from]
+                          (when (= [8] bytes)
+                            (let [port (udp/local-port @sock-ref)]
+                              (js/clearTimeout @timer)
+                              (js/clearTimeout @ack-timer)
+                              (udp/close! @sock-ref)
+                              (is @acknowledged?
+                                  "a DNS lookup started before prepare waited for route ACK")
+                              (is (= (str "[::1]:" port) from)
+                                  "the ACK's resolved address selected the actual underlay target")
+                              (done))))})
+          (.then (fn [sock]
+                   (reset! sock-ref sock)
+                   (reset! timer (js/setTimeout
+                                  (fn []
+                                    (udp/close! sock)
+                                    (is false "hostname UDP send timed out")
+                                    (done))
+                                  2000))
+                   (udp/guard-underlay! sock)
+                   (udp/send! sock [8] (str "localhost:" (udp/local-port sock)))
+                   (reset! ack-timer
+                           (js/setTimeout
+                            (fn []
+                              (reset! acknowledged? true)
+                              (udp/allow-underlay-hosts!
+                               sock ["localhost"] {"localhost" ["::1"]}))
+                            100)))
+                 (fn [error]
+                   (is false (str "dual-stack bind failed: " error))
+                   (done)))))))

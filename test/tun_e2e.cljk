@@ -1,12 +1,15 @@
 #!/usr/bin/env kbb
 (ns tun-e2e
   (:require [kekkai.node.netmap :as netmap]
+            [kekkai.node.packet :as packet]
             [kekkai.node.packet-bridge :as packet-bridge]
+            [kekkai.node.signed-netmap :as signed-netmap]
             [kekkai.node.relay-server :as relay-server]
             [kekkai.node.udp :as udp]
             [kotoba.bytes :as b]
             [noise.core :as noise]
             [noise.provider.node :as provider]
+            ["node:child_process" :as child-process]
             ["node:fs" :as fs]
             ["node:net" :as net]
             ["node:os" :as os]
@@ -14,10 +17,41 @@
 
 (def suite (noise/suite (provider/ports)))
 (def ipv4 [0x45 0 0 20 0 0 0 0 64 6 0 0 10 0 0 1 203 0 113 9])
+(def underlay-prefix [0x4b 0x4b 0x42 0x31 0x01])
 
 (defn keypair []
   (let [{:keys [priv pub]} (noise/keypair suite)]
     {:priv (b/hex priv) :pub (b/hex pub)}))
+
+(defn local-interface-addresses []
+  (let [interfaces (.networkInterfaces os)]
+    (->> (array-seq (js/Object.keys interfaces))
+         (mapcat #(array-seq (aget interfaces %)))
+         (map #(.-address %))
+         (filter #(.isIP net %))
+         distinct
+         vec)))
+
+(defn signing-authority []
+  (let [crypto (js/require "node:crypto")
+        pair (.generateKeyPairSync crypto "ed25519")
+        public-key (.-publicKey pair)]
+    {:crypto crypto
+     :private (.-privateKey pair)
+     :spki (.toString
+            (.export public-key #js {:format "der" :type "spki"})
+            "base64")}))
+
+(defn sign-netmap [authority value]
+  (let [payload (pr-str value)
+        bytes (.from js/Buffer payload "utf8")
+        signature (.sign (:crypto authority) nil bytes (:private authority))
+        digest (-> (.createHash (:crypto authority) "sha256")
+                   (.update bytes) (.digest "hex"))]
+    (pr-str {:netmap/payload-b64 (.toString bytes "base64")
+             :netmap/signature-b64 (.toString signature "base64")
+             :netmap/signer-spki-b64 (:spki authority)
+             :netmap/sha256 digest})))
 
 (defn wait-for [predicate]
   (let [deadline (+ (.getTime (js/Date.)) 15000)]
@@ -31,7 +65,8 @@
       (step))))
 
 (defn write-netmap!
-  [directory filename self-id peer-id self-key peer-key relay-key relay-port]
+  [directory filename self-id peer-id self-key peer-key relay-key relay-port
+   authority]
   (let [exit-peer?
         (= peer-id "exit")
         value
@@ -51,14 +86,23 @@
                      :route/bits 0}]))]
          :netmap/edges
          [{:edge/from "client" :edge/to "exit"
-           :edge/capabilities [:overlay :tun]}]
+           :edge/capabilities [:overlay :tun]}
+          {:edge/from "exit" :edge/to "client"
+           :edge/capabilities [:overlay]}]
          :netmap/relays
          [{:relay/name "test" :relay/region "test"
            :relay/host "127.0.0.1" :relay/port relay-port
            :relay/key (:pub relay-key)}]}
         file (.join path directory filename)]
-    (.writeFileSync fs file (pr-str value))
+    (.writeFileSync fs file (sign-netmap authority value))
     file))
+
+(defn assert-no-reverse-route! [file authority]
+  (let [nm (signed-netmap/verify-envelope
+            (.readFileSync fs file "utf8") (:spki authority))
+        parsed (packet/parse ipv4)]
+    (when (packet/route-peer nm parsed 0)
+      (throw (js/Error. "one-way :tun grant authorized a reverse route")))))
 
 (defn connect [socket-path]
   (js/Promise.
@@ -69,6 +113,15 @@
 
 (defn send-frame! [socket packet]
   (let [body (.from js/Buffer (clj->js packet))
+        header (.alloc js/Buffer 4)]
+    (.writeUInt32BE header (.-length body) 0)
+    (.write socket (.concat js/Buffer #js [header body]))))
+
+(defn send-control! [socket type payload]
+  (let [body (.concat js/Buffer
+                      #js [(.from js/Buffer
+                                  (clj->js [0x4b 0x4b 0x42 0x31 type]))
+                           (.from js/Buffer (.stringify js/JSON (clj->js payload)))])
         header (.alloc js/Buffer 4)]
     (.writeUInt32BE header (.-length body) 0)
     (.write socket (.concat js/Buffer #js [header body]))))
@@ -92,12 +145,67 @@
                      (vec (js/Uint8Array.
                            (.subarray @buffer 4 (+ 4 length))))))))))))))
 
+(defn receive-underlay [socket]
+  (-> (receive-frame socket)
+      (.then (fn [frame]
+               (when-not (= underlay-prefix (subvec frame 0 5))
+                 (throw (js/Error. "packet bridge did not publish underlay control")))
+               (js->clj
+                (.parse js/JSON
+                        (.toString
+                         (.from js/Buffer (clj->js (subvec frame 5)))
+                         "utf8"))
+                :keywordize-keys true)))))
+
+(defn run-swift-packet-transport [binary socket-path]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [process (.spawn child-process binary (clj->js [socket-path])
+                           #js {:stdio #js ["ignore" "pipe" "pipe"]})
+           out (atom "")
+           err (atom "")]
+       (.on (.-stdout process) "data" #(swap! out str (.toString %)))
+       (.on (.-stderr process) "data" #(swap! err str (.toString %)))
+       (.on process "error" reject)
+       (.on process "close"
+            (fn [code]
+              (if (= code 0)
+                (resolve @out)
+                (reject (js/Error.
+                         (str "Swift packet transport failed (" code ") stdout: "
+                              @out " stderr: " @err))))))))))
+
+(defn run-apple-adapter-e2e [binary client-socket exit-socket resources]
+  (-> (connect exit-socket)
+      (.then
+       (fn [exit-sidecar]
+         (swap! resources assoc :exit-sidecar exit-sidecar)
+         (send-control! exit-sidecar 3 {})
+         (-> (receive-underlay exit-sidecar)
+             (.then
+              (fn [snapshot]
+                (when-not (and (:ready snapshot)
+                               (some #(.isIP net %) (:addresses snapshot))
+                               (some #(= "127.0.0.1" %) (:addresses snapshot)))
+                  (throw (js/Error. "exit bridge underlay snapshot was incomplete")))
+                (send-control! exit-sidecar 2 {:addresses (:addresses snapshot)})
+                (println "  ok   exit bridge published and accepted underlay routes")
+                (js/Promise.all
+                 #js [(receive-frame exit-sidecar)
+                      (run-swift-packet-transport binary client-socket)])))
+             (.then
+              (fn [results]
+                (println (str "  ok   Swift KekkaiLocalNodeTransport: "
+                              (aget results 1)))
+                (aget results 0))))))))
+
 (defn -main []
   (println "\nKekkai full-tunnel packet E2E\n")
   (let [directory (.mkdtempSync fs (.join path (.tmpdir os) "kekkai-tun-"))
         relay-key (keypair)
         client-key (keypair)
         exit-key (keypair)
+        authority (signing-authority)
         resources (atom {})]
     (-> (relay-server/start
          {:port 0 :host "127.0.0.1"
@@ -115,18 +223,23 @@
                  client-netmap
                  (write-netmap! directory "client.edn"
                                 "client" "exit" client-key exit-key
-                                relay-key relay-port)
+                                relay-key relay-port authority)
                  exit-netmap
                  (write-netmap! directory "exit.edn"
                                 "exit" "client" exit-key client-key
-                                relay-key relay-port)
-                 common {:allow-unsigned-netmap? true
+                                relay-key relay-port authority)
+                 common {:netmap-authority-spki-b64 (:spki authority)
+                         ;; This bridge test covers the local Swift/Node
+                         ;; protocol, so keep Kekkai on its explicit loopback
+                         ;; relay and never inherit a Tailscale/LAN candidate.
+                         :candidate-excluded-hosts (local-interface-addresses)
                          :listen-port 0 :tick-ms 100
                          :policy {:rekey-timeout 1 :keepalive-timeout 3}
                          :disco {:call-me-maybe-ms 300 :probe-timeout-ms 300
                                  :heartbeat-ms 1000}}
                  client-socket (.join path directory "client.sock")
                  exit-socket (.join path directory "exit.sock")]
+             (assert-no-reverse-route! exit-netmap authority)
              (-> (js/Promise.all
                   #js [(packet-bridge/start
                         {:config
@@ -154,23 +267,75 @@
                          (fn [ready?]
                            (when-not ready?
                              (throw (js/Error. "TUN peers did not become ready")))
-                           (js/Promise.all
-                            #js [(connect client-socket)
-                                 (connect exit-socket)])))
+                           (when (and (not= "win32" (.-platform js/process))
+                                      (not= 0x180
+                                            (bit-and
+                                             (.-mode (.statSync fs client-socket))
+                                             0x1ff)))
+                             (throw (js/Error.
+                                     "packet bridge socket permissions are not 0600")))
+                           (if-let [swift-binary
+                                    (aget (.-env js/process)
+                                          "KEKKAI_APPLE_PACKET_TRANSPORT_HARNESS")]
+                             (run-apple-adapter-e2e
+                              swift-binary client-socket exit-socket resources)
+                             (js/Promise.all
+                              #js [(connect client-socket)
+                                   (connect exit-socket)]))))
                         (.then
-                         (fn [[client-sidecar exit-sidecar]]
-                           (swap! resources assoc
-                                  :client-sidecar client-sidecar
-                                  :exit-sidecar exit-sidecar)
-                           (let [received (receive-frame exit-sidecar)]
-                             (send-frame! client-sidecar ipv4)
-                             received)))
+                         (fn [sidecars-or-packet]
+                           (if (aget (.-env js/process)
+                                     "KEKKAI_APPLE_PACKET_TRANSPORT_HARNESS")
+                             sidecars-or-packet
+                             (let [[client-sidecar exit-sidecar] sidecars-or-packet]
+                               (swap! resources assoc
+                                      :client-sidecar client-sidecar
+                                      :exit-sidecar exit-sidecar)
+                               (send-control! client-sidecar 3 {})
+                               (send-control! exit-sidecar 3 {})
+                               (-> (js/Promise.all
+                                    #js [(receive-underlay client-sidecar)
+                                         (receive-underlay exit-sidecar)])
+                                   (.then
+                                    (fn [[client-underlay exit-underlay]]
+                                      (doseq [snapshot [client-underlay exit-underlay]]
+                                        (when-not (and (:ready snapshot)
+                                                       (some #(.isIP net %)
+                                                             (:addresses snapshot)))
+                                          (throw (js/Error.
+                                                  "underlay snapshot was not complete"))))
+                                      (when-not (some #(and (= 4 (:family %))
+                                                            (= [0 0 0 0] (:prefix %))
+                                                            (= 0 (:bits %)))
+                                                      (:routes client-underlay))
+                                        (throw (js/Error.
+                                                "signed client TUN route missing from OS snapshot")))
+                                      (when (seq (:routes exit-underlay))
+                                        (throw (js/Error.
+                                                "one-way TUN grant leaked into reverse OS routes")))
+                                      (when-not (and (some #(= "127.0.0.1" %)
+                                                           (:addresses client-underlay))
+                                                     (some #(= "127.0.0.1" %)
+                                                           (:addresses exit-underlay)))
+                                        (throw (js/Error.
+                                                "relay address missing from underlay exclusions")))
+                                      (println
+                                       "  ok   bridge publishes resolved relay underlay exclusions")
+                                      (send-control! client-sidecar 2
+                                                     {:addresses
+                                                      (:addresses client-underlay)})
+                                      (send-control! exit-sidecar 2
+                                                     {:addresses
+                                                      (:addresses exit-underlay)})
+                                      (let [received (receive-frame exit-sidecar)]
+                                        (send-frame! client-sidecar ipv4)
+                                        received))))))))
                         (.then
                          (fn [received]
                            (when-not (= ipv4 received)
                              (throw (js/Error. "raw IP packet changed in tunnel")))
                            (println
-                            "  ok   TUN frame → signed route → Noise → exit bridge")
+                            "  ok   signed Ed25519 netmap → TUN route → Noise → exit bridge")
                            (println
                             "  ok   one-way :tun edge created no reverse authority")
                            (println "\nFULL-TUNNEL E2E PASSED\n"))))))))))

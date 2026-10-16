@@ -14,7 +14,9 @@
   (:require [kotoba.lang.text :as str]
             [kekkai.node.dns-server :as dns-server]
             [kekkai.node.endpoint :as ep]
+            [kekkai.node.heartbeat :as node-heartbeat]
             [kekkai.node.netmap :as netmap]
+            [kekkai.node.netmap-watch :as netmap-watch]
             [kekkai.node.peer :as peer]
             [kekkai.node.relay :as relay]
             [kekkai.node.signed-netmap :as signed-netmap]
@@ -28,14 +30,33 @@
 (defn now-ms [] (.getTime (js/Date.)))
 (defn now-s [] (js/Math.floor (/ (now-ms) 1000)))
 
-(defn load-netmap
-  "Read and authenticate a netmap. Production defaults to a signed envelope.
+(def ^:private routine-events #{:data :packet :ping :pong})
+(def ^:private routine-drop-reasons #{:auth-failed :no-matching-peer})
+
+(defn log-event
+  "Print lifecycle/error metadata, omitting high-volume packets and payloads.
+  Callers that need detailed diagnostics can supply their own `:on-event`."
+  [event]
+  (when-not (or (contains? routine-events (:event event))
+                (and (= :dropped (:event event))
+                     (contains? routine-drop-reasons (:reason event))))
+    (let [payload (:payload event)
+          summary (cond-> (dissoc event :payload)
+                    (some? payload) (assoc :payload-size (count payload)))]
+      (println (str "[agent] " (pr-str summary))))))
+
+(defn netmap-from-text
+  "Parse and authenticate a netmap. Production defaults to a signed envelope.
    Raw EDN is available only through the explicit test/development opt-in."
-  [path {:keys [netmap-authority-spki-b64 allow-unsigned-netmap?]}]
-  (let [text (.readFileSync fs path "utf8")]
-    (if allow-unsigned-netmap?
-      (cljs.reader/read-string text)
-      (signed-netmap/verify-envelope text netmap-authority-spki-b64))))
+  [text {:keys [netmap-authority-spki-b64 allow-unsigned-netmap?]}]
+  (if allow-unsigned-netmap?
+    (cljs.reader/read-string text)
+    (signed-netmap/verify-envelope text netmap-authority-spki-b64)))
+
+(defn load-netmap
+  "Read and authenticate a netmap from a file."
+  [path config]
+  (netmap-from-text (.readFileSync fs path "utf8") config))
 
 (defn- static-keypair [{:keys [priv pub]}]
   {:priv (b/unhex priv) :pub (b/unhex pub)})
@@ -52,11 +73,28 @@
      :self-id self-id
      :config config
      :netmap nm
+     :netmap-source-text (:netmap-source-text config)
+     :netmap-rejected-source nil
+     :netmap-read-error nil
      :prologue (b/utf8-encode (netmap/prologue-string nm))
      :peers {}            ; peer-id -> peer state
      :by-key {}           ; key-hex -> peer-id
      :relay nil           ; relay client state
+     :relay-pool (netmap/relays nm) ; signed priority order for failover
+     :relay-index 0
      :local-candidates []
+     :heartbeat {:enabled? (boolean (:heartbeat config))
+                 :sequence 0
+                 :last-accepted-at nil
+                 :last-error nil}
+     :netmap-watch {:enabled? (boolean (:netmap-watch config))
+                    :status (if (:netmap-watch config) :starting :disabled)
+                    :last-installed-version (:netmap/version nm)
+                    :last-error nil}
+     :nat {:status (if (seq (:stun-servers config)) :pending :disabled)
+           :servers-answered 0
+           :candidates []
+           :symmetric? nil}
      :sock nil}))
 
 (defn- peer-for-key [st key-hex] (get (:peers st) (get (:by-key st) key-hex)))
@@ -71,7 +109,8 @@
         sessionable (netmap/sessionable nm (quot now-ms* 1000))
         wanted (into {} (map (fn [{:keys [peer]}] [(:node/id peer) peer]))
                      sessionable)
-        relay-region (some-> (first (netmap/relays nm)) :relay/region)
+        relay-region (or (some-> (:relay st) :region)
+                         (some-> (first (netmap/relays nm)) :relay/region))
         peers (into {}
                     (for [[pid p] wanted]
                       [pid (or (get (:peers st) pid)
@@ -81,7 +120,10 @@
                                            :peer-id pid
                                            :prologue (:prologue st)
                                            :relay-region relay-region
-                                           :candidates (netmap/endpoints p)
+                                           :candidates (ep/exclude-candidate-hosts
+                                                        (netmap/endpoints p)
+                                                        (:candidate-excluded-hosts
+                                                         (:config st)))
                                            :initiator? (peer/should-initiate?
                                                         (:self-id st) pid)
                                            :disco-config (:disco (:config st))
@@ -110,6 +152,152 @@
                st)                    ; no relay yet; the tick will retry
       st)))
 
+(defn- relay-client-for [st record]
+  (relay/client {:suite (:suite st) :static (:static st)
+                 :relay-key (b/unhex (:relay/key record))
+                 :relay-addr (relay/relay-addr record)
+                 :relay-name (:relay/name record)
+                 :region (:relay/region record)
+                 :prologue (:prologue st)
+                 :config (:relay (:config st))}))
+
+(defn reconfigure-netmap
+  "Prepare an authenticated, newer netmap for this running node.
+
+  A version change changes the Noise prologue. Recreate every peer session and
+  the relay session together so an old policy session cannot outlive the
+  publication that replaced it. The local node ID, tailnet, and X25519 key are
+  immutable for a running process; key rotation requires a restart with the new
+  private key. Returns the new state and the first relay datagram to send."
+  [st nm now-ms*]
+  (let [problems (netmap/validate nm)
+        current (:netmap st)
+        old-version (:netmap/version current)
+        new-version (:netmap/version nm)
+        self (:netmap/self nm)
+        expected-key (b/hex (get-in st [:static :pub]))]
+    (when (seq problems)
+      (throw (ex-info "replacement netmap is not usable"
+                      {:type :kekkai/invalid-replacement-netmap
+                       :problems problems})))
+    (when (= nm current)
+      (throw (ex-info "replacement netmap has no changes"
+                      {:type :kekkai/unchanged-netmap})))
+    (when-not (> new-version old-version)
+      (throw (ex-info "replacement netmap version must increase"
+                      {:type :kekkai/non-monotonic-netmap
+                       :current old-version :received new-version})))
+    (when-not (= (:netmap/tailnet current) (:netmap/tailnet nm))
+      (throw (ex-info "replacement netmap changes tailnet"
+                      {:type :kekkai/netmap-tailnet-changed})))
+    (when-not (= (:self-id st) (:node/id self))
+      (throw (ex-info "replacement netmap changes local node ID"
+                      {:type :kekkai/netmap-self-changed
+                       :current (:self-id st) :received (:node/id self)})))
+    (when-not (= expected-key (:node/key self))
+      (throw (ex-info "replacement netmap changes local node key"
+                      {:type :kekkai/netmap-self-key-changed})))
+    (let [old-peers (set (keys (:peers st)))
+          pool (netmap/relays nm)
+          base (-> st
+                   (assoc :netmap nm
+                          :prologue (b/utf8-encode (netmap/prologue-string nm))
+                          :relay nil
+                          :relay-pool pool
+                          :relay-index 0
+                          :peers {}
+                          :by-key {}
+                          :denied (netmap/denials nm :overlay
+                                                 (quot now-ms* 1000)))
+                   (sync-peers now-ms*))
+          removed (vec (remove (set (keys (:peers base))) old-peers))
+          relay-record (first pool)
+          [base send] (if relay-record
+                        (let [[rc dg] (relay/client-hello
+                                       (relay-client-for base relay-record) now-ms*)]
+                          [(assoc base :relay rc :relay-index 0) [dg]])
+                        [base []])]
+      {:state base
+       :send send
+       :events [{:event :netmap-updated
+                 :from-version old-version
+                 :to-version new-version
+                 :reset-peers (vec old-peers)
+                 :removed-peers removed}]})))
+
+(defn- apply-netmap-text! [state-atom on-event text]
+  (let [result (try
+                 (let [current @state-atom
+                       nm (netmap-from-text text (:config current))]
+                   (if (= nm (:netmap current))
+                     {:state (assoc current
+                                    :netmap-source-text text
+                                    :netmap-rejected-source nil
+                                    :netmap-read-error nil)}
+                     (let [{next-state :state sends :send events :events}
+                           (reconfigure-netmap current nm (now-ms))]
+                       {:state (assoc next-state
+                                      :netmap-source-text text
+                                      :netmap-rejected-source nil
+                                      :netmap-read-error nil)
+                        :send sends
+                        :events events})))
+                 (catch :default error {:error error}))]
+    (if-let [error (:error result)]
+      (do
+        (swap! state-atom assoc :netmap-rejected-source text)
+        (on-event {:event :netmap-rejected
+                   :reason (or (ex-message error) "invalid netmap")}))
+      (do
+        (reset! state-atom (:state result))
+        (doseq [{:keys [bytes to]} (:send result)]
+          (udp/send! (:sock (:state result)) bytes to))
+        (doseq [event (:events result)]
+          (on-event event))))))
+
+(defn poll-netmap!
+  "Read the configured netmap path and apply a newly authenticated version.
+
+  The producer should replace the file atomically. A transient or invalid file
+  is rejected once per byte string and never replaces the last good state."
+  [state-atom on-event]
+  (let [st @state-atom
+        path (get-in st [:config :netmap-file])]
+    (when (seq path)
+      (try
+        (let [text (.readFileSync fs path "utf8")]
+          (when-not (or (= text (:netmap-source-text @state-atom))
+                        (= text (:netmap-rejected-source @state-atom)))
+            (apply-netmap-text! state-atom on-event text)))
+        (catch :default error
+          (let [reason (or (ex-message error) "netmap file unavailable")]
+            (when-not (= reason (:netmap-read-error @state-atom))
+              (swap! state-atom assoc :netmap-read-error reason)
+              (on-event {:event :netmap-read-error :reason reason}))))))))
+
+(defn- failover-relay
+  "Move to the next signed relay after a dead session or failed registration.
+   A one-relay netmap retries that relay in place."
+  [st on-event reason]
+  (let [now (now-ms)
+        pool (:relay-pool st)
+        current (:relay st)]
+    (if (> (count pool) 1)
+      (let [record (relay/next-home pool (:name current))
+            idx (or (first (keep-indexed
+                            (fn [i r] (when (= (:relay/name r) (:relay/name record)) i))
+                            pool))
+                    0)
+            [rc dg] (relay/client-hello (relay-client-for st record) now)]
+        (udp/send! (:sock st) (:bytes dg) (:to dg))
+        (on-event {:event :relay-failover :from (:name current) :to (:relay/name record)
+                   :reason reason})
+        (assoc st :relay rc :relay-index idx))
+      (let [[rc dg] (relay/client-reconnect current now)]
+        (udp/send! (:sock st) (:bytes dg) (:to dg))
+        (on-event {:event :relay-reconnect :region (:region rc) :reason reason})
+        (assoc st :relay rc)))))
+
 (defn- apply-peer-out!
   [st peer-id {:keys [state send events] :as _out} on-event]
   (let [st (assoc-in st [:peers peer-id] state)
@@ -118,21 +306,32 @@
     st))
 
 (defn- handle-peer-datagram [st peer-id bytes from-endpoint on-event]
-  (let [p (get-in st [:peers peer-id])
+  (let [before-candidates (set (keys (get-in st [:peers peer-id :disco :paths])))
+        p (get-in st [:peers peer-id])
         out (peer/on-datagram p {:bytes bytes :now-s (now-s) :now-ms (now-ms)
                                  :from-endpoint from-endpoint})
-        st (apply-peer-out! st peer-id out on-event)]
+        st (apply-peer-out! st peer-id out on-event)
+        st (reduce (fn [st {:keys [event tx-id endpoint candidates]}]
+                     (case event
+                       :ping (let [[p dg] (peer/send-pong (get-in st [:peers peer-id])
+                                                          endpoint tx-id (now-s))]
+                               (send-out! (assoc-in st [:peers peer-id] p) dg))
+                       :call-me-maybe
+                       (update-in st [:peers peer-id] peer/note-call-me-maybe
+                                  (ep/exclude-candidate-hosts
+                                   candidates
+                                   (:candidate-excluded-hosts (:config st)))
+                                  (now-ms))
+                       st))
+                   st
+                   (:events out))
+        after-candidates (set (keys (get-in st [:peers peer-id :disco :paths])))]
     ;; answer disco pings, and fold a peer's candidate list into disco
-    (reduce (fn [st {:keys [event tx-id endpoint candidates]}]
-              (case event
-                :ping (let [[p dg] (peer/send-pong (get-in st [:peers peer-id])
-                                                   endpoint tx-id (now-s))]
-                        (send-out! (assoc-in st [:peers peer-id] p) dg))
-                :call-me-maybe (update-in st [:peers peer-id] peer/note-call-me-maybe
-                                          candidates (now-ms))
-                st))
-            st
-            (:events out))))
+    (when (not= before-candidates after-candidates)
+      ;; Packet-bridge consumers defer this notification until the state atom
+      ;; commits, then refresh OS underlay exclusions before the next probe tick.
+      (on-event {:event :underlay-candidates-changed :peer peer-id}))
+    st))
 
 (defn on-datagram
   "Dispatch an inbound datagram: relay frames to the relay client, peer frames to
@@ -142,6 +341,10 @@
   (let [relay-frame (relay/decode-frame bytes)
         peer-frame (peer/decode-frame bytes)]
     (cond
+      ;; STUN shares this UDP socket with relay and peer traffic. Its response
+      ;; listener consumes the message; it is not a malformed peer datagram.
+      (stun/valid-message? bytes) st
+
       ;; from the relay socket we expect relay frames
       (and (:relay st) (= from (:relay-addr (:relay st))) (:type relay-frame))
       (let [{:keys [state send events]} (relay/client-on-datagram
@@ -159,6 +362,10 @@
 
       ;; a direct peer frame: we do not know which peer until it decrypts, so try
       ;; the established ones first (cheap: the frame either decrypts or not)
+      ;; Signed-netmap bootstrap punches are one-way NAT openers. They carry no
+      ;; peer identity and must never trigger a response or authorize a session.
+      (= :bootstrap-punch (:type peer-frame)) st
+
       (:type peer-frame)
       (let [candidates (keys (:peers st))
             endpoint (ep/parse from :reflexive)]
@@ -179,23 +386,30 @@
 
 (defn tick
   [st on-event]
-  (let [now-s* (now-s)
+  (let [now-ms* (now-ms)
+        now-s* (quot now-ms* 1000)
         ;; relay: connect / keepalive
         st (cond
              (nil? (:relay st)) st
-             (relay/client-hello-due? (:relay st) (now-ms))
-             (let [[rc dg] (relay/client-hello (:relay st) (now-ms))]
+             (relay/client-liveness-expired? (:relay st) now-ms*)
+             (failover-relay st on-event :liveness-timeout)
+             (relay/client-handshake-expired? (:relay st) now-ms*)
+             (failover-relay st on-event :handshake-timeout)
+             (relay/client-hello-due? (:relay st) now-ms*)
+             (let [[rc dg] (relay/client-hello (:relay st) now-ms*)]
                (udp/send! (:sock st) (:bytes dg) (:to dg))
                (assoc st :relay rc))
-             (relay/client-keepalive-due? (:relay st) (now-ms))
-             (let [[rc dg] (relay/client-ping (:relay st) [] (now-ms))]
+             (relay/client-keepalive-due? (:relay st) now-ms*)
+             (let [[rc dg] (relay/client-ping (:relay st) [] now-ms*)]
                (udp/send! (:sock st) (:bytes dg) (:to dg))
                (assoc st :relay rc))
              :else st)]
     (reduce (fn [st pid]
               (let [out (peer/tick (get-in st [:peers pid])
                                    {:now-s now-s* :now-ms (now-ms)
-                                    :local-candidates (:local-candidates st)})]
+                                    :local-candidates (:local-candidates st)
+                                    :bootstrap-direct? (not (and (:relay st)
+                                                                 (relay/connected? (:relay st))))})]
                 (apply-peer-out! st pid out on-event)))
             st
             (keys (:peers st)))))
@@ -251,33 +465,122 @@
   {:node (:self-id st)
    :netmap-version (:netmap/version (:netmap st))
    :relay (when (:relay st)
-            {:region (:region (:relay st)) :connected? (relay/connected? (:relay st))})
+            {:name (:name (:relay st)) :region (:region (:relay st))
+             :connected? (relay/connected? (:relay st))
+             :configured-count (count (:relay-pool st))})
    :local-candidates (:local-candidates st)
+   :heartbeat (:heartbeat st)
+   :netmap-watch (:netmap-watch st)
+   :nat (:nat st)
    :peers (mapv #(peer/summary % (now-ms)) (vals (:peers st)))
    :denied (:denied st)})
 
+(defn- validate-local-identity! [config nm]
+  (let [self (:netmap/self nm)
+        configured-id (:node/id config)
+        configured-key (some-> (:pub (:static config)) b/unhex b/hex)]
+    (when (and configured-id (not= configured-id (:node/id self)))
+      (throw (ex-info "configured node ID does not match the signed netmap"
+                      {:type :kekkai/netmap-self-mismatch})))
+    (when-not (= configured-key (:node/key self))
+      (throw (ex-info "configured static key does not match the signed netmap"
+                      {:type :kekkai/netmap-self-key-mismatch}))))
+  nm)
+
 ;; ── process ─────────────────────────────────────────────────────────────────
 
-(defn start
+(defn- start-agent!
   "-> Promise of `{:state-atom :stop :status}`.
 
    `config`:
      :node/id     this node's id (must match the netmap's :netmap/self)
      :static      {:priv hex :pub hex} — this node's X25519 identity
      :netmap-file path to the netmap EDN
+     :netmap-poll-ms interval for signed netmap updates (default 1000)
+     :listen-host UDP bind address (default ::, dual-stack IPv4/IPv6; 0.0.0.0
+                  also selects the dual-stack wildcard)
      :listen-port UDP port for the overlay (0 = ephemeral)
      :stun-servers [\"host:port\" …] for reflexive candidates
+     :candidate-excluded-hosts [\"IP\" …] exact IPs omitted from local and
+                                  peer candidate discovery
+     :heartbeat {:url https://… :did … :seed-file … :sequence-file …}
+                  optional enrolled Ed25519 identity for candidate publication
      :dns         {:enabled? true :port 5354}
      :tick-ms     default 1000"
-  [{:keys [config on-event] :or {on-event (fn [e] (println (str "[agent] " (pr-str e))))}}]
-  (let [nm (load-netmap (:netmap-file config) config)
+  [{:keys [config on-event] :or {on-event log-event}}]
+  (let [source-text (.readFileSync fs (:netmap-file config) "utf8")
+        nm (validate-local-identity! config (netmap-from-text source-text config))
         problems (netmap/validate nm)]
     (when (seq problems)
       (throw (ex-info "netmap is not usable" {:problems problems})))
-    (let [st (atom (state {:config config :nm nm}))
-          tick-ms (or (:tick-ms config) 1000)]
+    (let [config (assoc config :netmap-source-text source-text)
+          heartbeat-config (:heartbeat config)
+          heartbeat-identity (when heartbeat-config
+                               (node-heartbeat/load-identity! heartbeat-config))
+          self-id (or (:node/id (:netmap/self nm)) (:node/id config))
+          _ (when (and heartbeat-config
+                       (not= (:did heartbeat-config) (:did heartbeat-identity)))
+              (throw (ex-info "heartbeat DID does not match the node's enrolled identity"
+                              {:type :kekkai/heartbeat-did-mismatch})))
+          heartbeat-interval-ms (or (:interval-ms heartbeat-config) 30000)
+          _ (when (and heartbeat-config
+                       (not (<= 1000 heartbeat-interval-ms 3600000)))
+              (throw (ex-info "heartbeat interval must be in 1000..3600000 ms"
+                              {:type :kekkai/invalid-heartbeat-interval})))
+          st (atom (state {:config config :nm nm}))
+          tick-ms (or (:tick-ms config) 1000)
+          netmap-poll-ms (or (:netmap-poll-ms config) 1000)
+          last-heartbeat-endpoints (atom nil)
+          last-heartbeat-at (atom 0)
+          heartbeat-in-flight? (atom false)
+          publish-heartbeat!
+          (fn [force?]
+            (when (and heartbeat-config
+                       (not @heartbeat-in-flight?)
+                       (not= :pending (get-in @st [:nat :status])))
+              (try
+                (let [candidates (:local-candidates @st)
+                      endpoints (node-heartbeat/candidate-strings candidates)
+                      now (now-ms)
+                      changed? (not= endpoints @last-heartbeat-endpoints)
+                      due? (>= (- now @last-heartbeat-at) heartbeat-interval-ms)]
+                  (when (or changed? force? due?)
+                    (reset! heartbeat-in-flight? true)
+                    (-> (node-heartbeat/post!
+                         (assoc heartbeat-config
+                                :node-id self-id
+                                :seed (:seed heartbeat-identity))
+                         candidates)
+                        (.then (fn [{:keys [sequence]}]
+                                 (reset! last-heartbeat-endpoints endpoints)
+                                 (reset! last-heartbeat-at (now-ms))
+                                 (swap! st assoc :heartbeat
+                                        {:enabled? true :sequence sequence
+                                         :last-accepted-at (now-s) :last-error nil})
+                                 (on-event {:event :heartbeat-accepted
+                                            :node self-id :sequence sequence})
+                                 (reset! heartbeat-in-flight? false)))
+                        (.catch (fn [error]
+                                  (reset! heartbeat-in-flight? false)
+                                  (let [status (some-> error ex-data :status)
+                                        reason (or status (ex-message error))]
+                                    (swap! st assoc :heartbeat
+                                           {:enabled? true
+                                            :sequence (:sequence (:heartbeat @st))
+                                            :last-accepted-at (:last-accepted-at
+                                                               (:heartbeat @st))
+                                            :last-error reason})
+                                    (on-event {:event :heartbeat-error :node self-id
+                                               :status status :reason reason})))))))
+                (catch :default error
+                  (reset! heartbeat-in-flight? false)
+                  (let [reason (or (some-> error ex-data :type) :invalid-candidates)]
+                    (swap! st assoc-in [:heartbeat :last-error] reason)
+                    (on-event {:event :heartbeat-error :node self-id
+                               :reason reason}))))))]
       (-> (udp/socket
            {:port (or (:listen-port config) 0)
+            :host (:listen-host config)
             ;; A datagram handler that throws must neither crash the process nor
             ;; silently swallow the packet: an exception here previously lost a
             ;; relay handshake response with no trace of why (found in the E2E).
@@ -292,15 +595,14 @@
            (fn [sock]
              (swap! st assoc :sock sock)
              (swap! st assoc :local-candidates
-                    (udp/local-candidates (udp/local-port sock)))
-             ;; relay client, if the netmap publishes a relay
-             (when-let [r (first (netmap/relays nm))]
-               (swap! st assoc :relay
-                      (relay/client {:suite (:suite @st) :static (:static @st)
-                                     :relay-key (b/unhex (:relay/key r))
-                                     :relay-addr (relay/relay-addr r)
-                                     :region (:relay/region r)
-                                     :prologue (:prologue @st)})))
+                    (ep/exclude-candidate-hosts
+                     (udp/local-candidates (udp/local-port sock))
+                     (:candidate-excluded-hosts config)))
+             ;; connect to the first relay in the signed publication order
+             (when-let [r (first (:relay-pool @st))]
+               (let [[rc dg] (relay/client-hello (relay-client-for @st r) (now-ms))]
+                 (swap! st assoc :relay rc :relay-index 0)
+                 (udp/send! sock (:bytes dg) (:to dg))))
              (swap! st sync-peers (now-ms))
              (on-event {:event :started :node (:self-id @st)
                         :port (udp/local-port sock)
@@ -308,16 +610,42 @@
                         :denied (:denied @st)})
              ;; reflexive candidates on the *same* socket the data plane uses
              (when (seq (:stun-servers config))
-               (-> (stun/candidates {:servers (:stun-servers config) :sock sock})
-                   (.then (fn [{:keys [candidates symmetric?]}]
-                            (swap! st update :local-candidates into candidates)
-                            (on-event {:event :reflexive :candidates candidates
-                                       :symmetric-nat? symmetric?})))))
+               (-> (stun/candidates {:servers (:stun-servers config)
+                                     :sock sock
+                                     :timeout-ms (or (:stun-timeout-ms config) 5000)})
+                   (.then (fn [{:keys [candidates servers-answered symmetric?] :as nat}]
+                            (let [candidates (ep/exclude-candidate-hosts
+                                              candidates
+                                              (:candidate-excluded-hosts config))]
+                              (swap! st update :local-candidates into candidates)
+                              (swap! st assoc :nat (assoc nat :candidates candidates
+                                                          :status :complete))
+                              (on-event {:event :reflexive :candidates candidates
+                                       :servers-answered servers-answered
+                                       :symmetric-nat? symmetric?})
+                              (publish-heartbeat! true))))
+                   (.catch (fn [error]
+                             (swap! st assoc :nat
+                                    {:status :error :servers-answered 0
+                                     :candidates [] :symmetric? nil})
+                             (on-event {:event :reflexive-error
+                                        :reason (ex-message error)})
+                             (publish-heartbeat! true)))))
+             (when-not (seq (:stun-servers config))
+               (publish-heartbeat! true))
              (let [timer (js/setInterval #(swap! st tick on-event) tick-ms)
+                   netmap-timer (js/setInterval #(poll-netmap! st on-event)
+                                                 netmap-poll-ms)
+                   heartbeat-timer (when heartbeat-config
+                                     (js/setInterval #(publish-heartbeat! false)
+                                                     heartbeat-interval-ms))
                    base {:state st
                          :status #(status @st)
                          :stop (fn []
                                  (js/clearInterval timer)
+                                 (js/clearInterval netmap-timer)
+                                 (when heartbeat-timer
+                                   (js/clearInterval heartbeat-timer))
                                  (udp/close! sock)
                                  (on-event {:event :stopped}))}]
                (if-not (get-in config [:dns :enabled?])
@@ -333,6 +661,76 @@
                               (assoc base
                                      :dns-port (udp/local-port (:sock d))
                                      :stop (fn [] ((:stop base)) ((:stop d)))))))))))))))
+
+(defn- configured-netmap-watch [config]
+  (when-let [watch (:netmap-watch config)]
+    (when-not (map? watch)
+      (throw (ex-info ":netmap-watch must be a map"
+                      {:type :kekkai/invalid-netmap-watch-config})))
+    (let [heartbeat-config (:heartbeat config)
+          read-identity (or (:heartbeat watch)
+                            (select-keys heartbeat-config [:did :seed-file]))
+          watch-config (assoc watch
+                              :node-id (or (:node-id watch) (:node/id config))
+                              :authority-spki-b64 (:netmap-authority-spki-b64 config)
+                              :output-file (:netmap-file config)
+                              :heartbeat read-identity)]
+      (netmap-watch/validate-config! watch-config))))
+
+(defn- bootstrapped-netmap! [config watch-config]
+  (if (or (nil? watch-config)
+          (.existsSync fs (:netmap-file config)))
+    (js/Promise.resolve :cached)
+    (-> (js/Promise.resolve)
+        (.then (fn [_] (netmap-watch/install-current! watch-config)))
+        (.then (fn [result]
+                 (when (= :unavailable (:status result))
+                   (throw (ex-info "no signed bootstrap netmap is published for this node"
+                                   {:type :kekkai/netmap-bootstrap-unavailable
+                                    :subject (:subject watch-config)})))
+                 result)))))
+
+(defn- attach-netmap-watch [handle watch-config on-event]
+  (if-not watch-config
+    handle
+    (let [state-atom (:state handle)
+          watcher (netmap-watch/start!
+                   watch-config
+                   (fn [event]
+                     (case (:event event)
+                       :netmap-watch-result
+                       (swap! state-atom update :netmap-watch merge
+                              {:enabled? true
+                               :status (:status event)
+                               :last-installed-version (:netmap/version event)
+                               :last-error nil})
+
+                       :netmap-watch-error
+                       (swap! state-atom update :netmap-watch merge
+                              {:enabled? true :status :error
+                               :last-error (:reason event)})
+                       nil)
+                     (on-event event)))]
+      (on-event {:event :netmap-watch-started
+                 :subject (:subject watch-config)
+                 :poll-ms (or (:poll-ms watch-config) 5000)})
+      (assoc handle :stop
+             (fn []
+               ((:stop watcher))
+               ((:stop handle)))))))
+
+(defn start
+  "Start the resident agent and optionally keep its signed netmap fresh.
+
+  With `:netmap-watch`, a missing cache is fetched and verified before the UDP
+  identity starts. An existing signed cache starts immediately while the
+  cancellable watcher refreshes it in the background."
+  [{:keys [config on-event] :or {on-event log-event}}]
+  (let [watch-config (configured-netmap-watch config)
+        args {:config config :on-event on-event}]
+    (-> (bootstrapped-netmap! config watch-config)
+        (.then (fn [_] (start-agent! args)))
+        (.then #(attach-netmap-watch % watch-config on-event)))))
 
 (defn -main [& args]
   (let [path (or (first args) "kekkai-node.edn")

@@ -1,6 +1,7 @@
 (ns kekkai.node.netmap-test
   (:require [kotoba.test :refer [deftest is testing]]
-            [kekkai.node.netmap :as netmap]))
+            [kekkai.node.netmap :as netmap]
+            [kekkai.node.endpoint :as endpoint]))
 
 (def nm
   {:netmap/version 42
@@ -25,6 +26,15 @@
     {:edge/from "asher" :edge/to "stale" :edge/capabilities [:overlay]}]
    :netmap/relays [{:relay/name "jp-tyo-1" :relay/region "jp"
                     :relay/host "relay.example" :relay/port 41642 :relay/key "ff"}]})
+
+(deftest signed-ipv6-endpoint-is-consumable-by-the-node
+  (let [candidate {:kind :reflexive :host "2001:db8::7" :port 41642}
+        peer {:node/endpoints [candidate]}
+        published (netmap/endpoints peer)
+        normalized (endpoint/normalize published)]
+    (is (= [candidate] published))
+    (is (= [candidate] normalized))
+    (is (= "[2001:db8::7]:41642" (endpoint/->str (first normalized))))))
 
 (deftest validation
   (is (netmap/usable? nm))

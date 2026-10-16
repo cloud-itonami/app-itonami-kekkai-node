@@ -16,6 +16,10 @@
   - **Handshake retries are the initiator's job only**, per
     `noise.session/handshake-plan`. If both sides retried on the same trigger
     they would collide indefinitely; the responder answers and waits.
+  - **Rekeys are make-before-break.** The responder stages up to three
+    authenticated handshake results and keeps the old receive sessions for a
+    short grace period. The first packet under a new key promotes that session;
+    this lets delayed retry responses and in-flight UDP frames arrive safely.
   - **Every datagram is tagged with its inner type before encryption**, so a data
     frame can never be mistaken for a disco frame by a peer running a different
     version — it fails to parse instead of being misinterpreted."
@@ -29,7 +33,8 @@
 (def ^:const magic 0x6b)
 (def ^:const version 1)
 
-(def frame-types {:handshake-init 0x30 :handshake-resp 0x31 :transport 0x32})
+(def frame-types {:handshake-init 0x30 :handshake-resp 0x31 :transport 0x32
+                  :bootstrap-punch 0x33})
 (def ^:private frame-type->kw (into {} (map (fn [[k v]] [v k])) frame-types))
 
 (def inner-types {:data 0x01 :ping 0x02 :pong 0x03 :call-me-maybe 0x04 :keepalive 0x05})
@@ -81,12 +86,19 @@
    :handshake-seq 0
    :session-id nil
    :session nil
+   ;; A rekey is a fresh IK handshake. Keep the old receive state briefly while
+   ;; the new session is authenticated and the first new-key packet arrives;
+   ;; UDP may reorder that packet with frames still in flight on the old key.
+   :pending-sessions []
+   :previous-sessions []
    :attempt nil
    ;; policy governs both the handshake retry schedule (before there is a
    ;; session to carry it) and the session's own rekey/keepalive timers
-   :policy (merge noise-session/default-policy policy)
+   :policy (merge {:rekey-grace 10}
+                  noise-session/default-policy policy)
    :route :relay
    :endpoint nil
+   :bootstrap-punch-at nil
    :disco (disco/new-peer {:peer-id peer-id :relay-region relay-region
                            :candidates candidates :now now :config disco-config})
    :established-at nil})
@@ -101,6 +113,31 @@
 
 (defn- outgoing [st bytes]
   (merge {:bytes bytes :peer-id (:peer-id st) :peer-key (:peer-key st)} (route-for st)))
+
+(def ^:private max-bootstrap-candidates 32)
+(def ^:private bootstrap-punch-interval-ms 1000)
+
+(defn- bootstrap-endpoints [st]
+  (->> (get-in st [:disco :paths])
+       vals
+       (map :endpoint)
+       (sort-by ep/ekey)
+       (take max-bootstrap-candidates)
+       vec))
+
+(defn- direct-copies [datagram endpoints]
+  (mapv (fn [endpoint]
+          (assoc datagram :route :direct :endpoint endpoint))
+        endpoints))
+
+(defn- bootstrap-punches [endpoints]
+  (mapv (fn [endpoint]
+          {:bytes (encode-frame :bootstrap-punch [])
+           :route :direct :endpoint endpoint})
+        endpoints))
+
+(defn- signed-candidate? [st endpoint]
+  (contains? (get-in st [:disco :paths]) (ep/ekey endpoint)))
 
 (defn dial
   "Start (or retry) the IK handshake. -> [state datagram] — the datagram is
@@ -130,6 +167,27 @@
     :keepalive {:event :keepalive}
     {:event :ignored :type type :at now-ms}))
 
+(defn- try-decrypt [sess payload now-s]
+  (when (and sess (not (noise-session/expired? sess now-s)))
+    (try
+      (let [[sess' inner] (noise/decrypt sess payload {:now now-s})]
+        {:session sess' :inner inner})
+      (catch #?(:clj Exception :cljs :default) _ nil))))
+
+(defn- promote-pending-session [st pending-index session now-s]
+  (let [previous (vec
+                  (take 3
+                        (concat (when (:session st)
+                                  [{:session (:session st)
+                                    :expires-at (+ now-s (get-in st [:policy :rekey-grace]))}])
+                                (filter #(> (:expires-at %) now-s)
+                                        (:previous-sessions st)))))]
+    (assoc st
+           :previous-sessions previous
+           :session session
+           :pending-sessions (into [] (concat (subvec (:pending-sessions st) 0 pending-index)
+                                              (subvec (:pending-sessions st) (inc pending-index)))))))
+
 (defn on-datagram
   "-> {:state … :send […] :events […]}. `from-endpoint` is the socket address the
    datagram arrived from (nil when it came via the relay), used to learn that a
@@ -144,24 +202,45 @@
       ;; A peer dialling us. We answer even if we also have a session in flight;
       ;; the last completed handshake wins, which is WireGuard's rule and avoids
       ;; a deadlock when both sides dial at once.
-      (try
-        (let [r (noise/responder {:suite suite :s static :prologue prologue})
-              [r _] (noise/read-message r payload)
-              [r msg2] (noise/write-message r [])]
-          (if-not (= (vec (noise/remote-static r)) (:peer-key st))
-            ;; The handshake authenticated a key that is not the one the netmap
-            ;; assigned to this peer id. Refuse: this is the check that keeps an
-            ;; authorized node from impersonating another node's name.
+      (if (and from-endpoint (not (signed-candidate? st from-endpoint)))
+        {:state st :send []
+         :events [{:event :handshake-source-not-authorized
+                   :endpoint (ep/->str from-endpoint)}]}
+        (try
+          (let [r (noise/responder {:suite suite :s static :prologue prologue})
+                [r _] (noise/read-message r payload)
+                [r msg2] (noise/write-message r [])]
+            (if-not (= (vec (noise/remote-static r)) (:peer-key st))
+              ;; The handshake authenticated a key that is not the one the netmap
+              ;; assigned to this peer id. Refuse: this is the check that keeps an
+              ;; authorized node from impersonating another node's name.
+              {:state st :send []
+               :events [{:event :wrong-static-key :expected (b/hex (:peer-key st))
+                         :got (b/hex (vec (noise/remote-static r)))}]}
+              (let [new-session (noise/session r {:now now-s :peer-id (:peer-id st)
+                                                  :policy (:policy st)})
+                    rekey? (some? (:session st))
+                    response (assoc (outgoing st (encode-frame :handshake-resp msg2))
+                                    :route (if from-endpoint :direct :relay)
+                                    :endpoint from-endpoint)]
+                {:state (cond-> (assoc st :handshakes [] :attempt nil
+                                        :established-at (if rekey? (:established-at st) now-s))
+                          rekey? (update :pending-sessions
+                                         #(vec (take 3 (cons new-session %))))
+                          (not rekey?) (assoc :pending-sessions []
+                                              :session new-session))
+                 :send [response]
+                 :events [(if rekey?
+                            {:event :rekey-staged :role :responder}
+                            {:event :established :role :responder})]})))
+          (catch #?(:clj Exception :cljs :default) e
             {:state st :send []
-             :events [{:event :wrong-static-key :expected (b/hex (:peer-key st))
-                       :got (b/hex (vec (noise/remote-static r)))}]}
-            {:state (assoc st
-                           :session (noise/session r {:now now-s :peer-id (:peer-id st) :policy (:policy st)})
-                           :handshakes [] :attempt nil :established-at now-s)
-             :send [(outgoing st (encode-frame :handshake-resp msg2))]
-             :events [{:event :established :role :responder}]}))
-        (catch #?(:clj Exception :cljs :default) e
-          {:state st :send [] :events [{:event :handshake-failed :reason (ex-message e)}]}))
+             :events [{:event :handshake-failed :reason (ex-message e)}]})))
+
+      (= :bootstrap-punch type)
+      ;; A three-byte UDP hole punch to a signed endpoint. It is intentionally
+      ;; unauthenticated and one-way: never answer it or use it to authorize a peer.
+      {:state st :send [] :events []}
 
       (= :handshake-resp type)
       (if (empty? (:handshakes st))
@@ -192,30 +271,56 @@
                 ;; unidentifiable "unexpected handshake response" — the
                 ;; difference between a log line that explains a race and one that
                 ;; looks like an attack. They are dropped when the session ends.
-                {:state (assoc st
-                               :session (noise/session r {:now now-s :peer-id (:peer-id st)
-                                                          :policy (:policy st)})
-                               :session-id id
-                               :attempt nil :established-at now-s)
-                 :send [] :events [{:event :established :role :initiator :attempt id}]})))))
+                (let [new-session (noise/session r {:now now-s :peer-id (:peer-id st)
+                                                    :policy (:policy st)})
+                      had-session? (some? (:session st))
+                      st' (assoc st :session-id id :attempt nil
+                                 :established-at now-s :session new-session)]
+                  {:state (if had-session?
+                            (update st' :previous-sessions
+                                    (fn [previous]
+                                      (vec (take 3
+                                                 (cons {:session (:session st)
+                                                        :expires-at (+ now-s
+                                                                       (get-in st [:policy :rekey-grace]))}
+                                                       (filter #(> (:expires-at %) now-s)
+                                                               previous))))))
+                            st')
+                 :send [] :events [{:event :established :role :initiator :attempt id}]}))))))
 
       (and (= :transport type) (:session st))
-      (try
-        (let [[sess inner] (noise/decrypt (:session st) payload {:now now-s})
-              decoded (decode-inner inner)
-              st (assoc st :session sess)]
-          (if (:error decoded)
-            {:state st :send [] :events [{:event :dropped :reason (:error decoded)}]}
-            (let [ev (inner-event st decoded now-ms from-endpoint)
-                  ;; a decrypted ping/pong from an address proves that path works
-                  st (cond-> st
-                       (and from-endpoint (#{:ping :pong} (:type decoded)))
-                       (update :disco disco/on-pong from-endpoint now-ms
-                               {:tx-id (:tx-id ev)}))]
-              {:state st :send [] :events [ev]})))
-        (catch #?(:clj Exception :cljs :default) e
-          {:state st :send [] :events [{:event :dropped :reason :auth-failed
-                                        :detail (ex-message e)}]}))
+      (let [decrypted (or (when-let [r (try-decrypt (:session st) payload now-s)]
+                            (assoc r :slot :current))
+                          (some (fn [[idx sess]]
+                                  (when-let [r (try-decrypt sess payload now-s)]
+                                    (assoc r :slot :pending :slot-index idx)))
+                                (map-indexed vector (:pending-sessions st)))
+                          (some (fn [[idx entry]]
+                                  (when (> (:expires-at entry) now-s)
+                                    (when-let [r (try-decrypt (:session entry) payload now-s)]
+                                      (assoc r :slot :previous :slot-index idx))))
+                                (map-indexed vector (:previous-sessions st))))]
+        (if-not decrypted
+          {:state st :send [] :events [{:event :dropped :reason :auth-failed}]}
+          (let [{:keys [session inner slot slot-index]} decrypted
+                st (case slot
+                     :current (assoc st :session session)
+                     :pending (promote-pending-session st slot-index session now-s)
+                     :previous (update-in st [:previous-sessions slot-index :session]
+                                          (constantly session)))
+                decoded (decode-inner inner)]
+            (if (:error decoded)
+              {:state st :send [] :events [{:event :dropped :reason (:error decoded)}]}
+              (let [ev (inner-event st decoded now-ms from-endpoint)
+                    ;; a decrypted ping/pong from an address proves that path works
+                    st (cond-> st
+                         (and from-endpoint (#{:ping :pong} (:type decoded)))
+                         (update :disco disco/on-pong from-endpoint now-ms
+                                 {:tx-id (:tx-id ev)}))]
+                {:state st :send []
+                 :events (cond-> [ev]
+                           (= :pending slot)
+                           (conj {:event :rekey-promoted :role :responder}))})))))
 
       :else {:state st :send [] :events [{:event :dropped :reason :no-session}]})))
 
@@ -256,28 +361,46 @@
 (defn tick
   "Everything due for this peer. -> {:state … :send […] :events […]}
 
-   Ordering matters: the session's own advice (`:expire` / `:rekey`) is applied
-   before disco's, so a session that must die is not first handed a keepalive."
-  [st {:keys [now-s now-ms local-candidates]}]
-  (let [sess (:session st)
+   Ordering matters: expired sessions are dropped before disco or keepalive can
+   use them; a due rekey starts after path selection so its handshake uses the
+   currently active route."
+  [st {:keys [now-s now-ms local-candidates bootstrap-direct?]}]
+  (let [st (-> st
+               (update :previous-sessions
+                       #(vec (filter (fn [entry] (> (:expires-at entry) now-s)) %)))
+               (update :pending-sessions
+                       #(vec (remove (fn [sess] (noise-session/expired? sess now-s)) %))))
+        sess (:session st)
         advice (when sess (noise/advice sess now-s))]
     (cond
       ;; dead session: drop it and let the next tick redial
       (and sess (contains? advice :expire))
       {:state (assoc st :session nil :session-id nil :handshakes []
+                     :pending-sessions [] :previous-sessions [] :attempt nil
                      :established-at nil)
        :send [] :events [{:event :expired :peer (:peer-id st)}]}
 
       ;; no session: dial on the initiator side, on the retry schedule
       (nil? sess)
-      (if-not (:initiator? st)
-        {:state st :send [] :events []}
-        (case (noise/handshake-plan (:attempt st) now-s (:policy st))
-          :send (let [[st dg] (dial st now-s)]
-                  {:state st :send [dg] :events [{:event :dialing :peer (:peer-id st)}]})
-          :give-up {:state (assoc st :attempt nil) :send []
-                    :events [{:event :handshake-gave-up :peer (:peer-id st)}]}
-          {:state st :send [] :events []}))
+      (let [endpoints (if bootstrap-direct? (bootstrap-endpoints st) [])
+            punch-due? (and (seq endpoints)
+                            (or (nil? (:bootstrap-punch-at st))
+                                (>= (- now-ms (:bootstrap-punch-at st))
+                                    bootstrap-punch-interval-ms)))
+            punches (if punch-due? (bootstrap-punches endpoints) [])
+            st (if punch-due? (assoc st :bootstrap-punch-at now-ms) st)]
+        (if-not (:initiator? st)
+          {:state st :send punches :events []}
+          (case (noise/handshake-plan (:attempt st) now-s (:policy st))
+            :send (let [[st dg] (dial st now-s)
+                        handshakes (if (seq endpoints)
+                                     (direct-copies dg endpoints)
+                                     [dg])]
+                    {:state st :send (into punches handshakes)
+                     :events [{:event :dialing :peer (:peer-id st)}]})
+            :give-up {:state (assoc st :attempt nil) :send punches
+                      :events [{:event :handshake-gave-up :peer (:peer-id st)}]}
+            {:state st :send punches :events []})))
 
       :else
       (let [{disco' :state :keys [pings switch-to call-me-maybe?]}
@@ -300,12 +423,23 @@
             ;; keepalive / rekey
             [st sends] (if (contains? advice :keepalive)
                          (let [[st dg] (send-keepalive st now-s)] [st (conj sends dg)])
-                         [st sends])]
+                         [st sends])
+            [st sends rekey-events] (if (contains? advice :rekey)
+                                     (case (noise-session/handshake-plan (:attempt st) now-s
+                                                                         (:policy st))
+                                       :send (let [[st dg] (dial st now-s)]
+                                               [st (conj sends dg)
+                                                [{:event :rekey-started :peer (:peer-id st)}]])
+                                       :give-up [(assoc st :attempt {:attempts 0 :last-at now-s
+                                                                     :started-at now-s})
+                                                 sends
+                                                 [{:event :rekey-gave-up :peer (:peer-id st)}]]
+                                       [st sends []])
+                                     [st sends []])]
         {:state st
          :send sends
-         :events (cond-> []
-                   switch-to (conj {:event :path-changed :peer (:peer-id st) :to switch-to})
-                   (contains? advice :rekey) (conj {:event :rekey-due :peer (:peer-id st)}))}))))
+         :events (cond-> (vec rekey-events)
+                   switch-to (conj {:event :path-changed :peer (:peer-id st) :to switch-to}))}))))
 
 (defn summary [st now-ms]
   {:peer (:peer-id st)

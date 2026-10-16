@@ -15,14 +15,16 @@
 
 (defn- pair
   "Two peer states facing each other. `a` initiates."
-  []
-  (let [ak (kp) bk (kp)
-        mk (fn [self other pid init?]
-             (peer/peer {:suite suite :static self :peer-key (:pub other)
-                         :peer-id pid :prologue prologue :relay-region "test"
-                         :candidates [] :initiator? init? :now 0
-                         :policy {:rekey-timeout 5}}))]
-    {:a (mk ak bk "judah" true) :b (mk bk ak "asher" false) :ak ak :bk bk}))
+  ([] (pair {}))
+  ([candidates]
+   (let [ak (kp) bk (kp)
+         mk (fn [self other pid init?]
+              (peer/peer {:suite suite :static self :peer-key (:pub other)
+                          :peer-id pid :prologue prologue :relay-region "test"
+                          :candidates (get candidates pid [])
+                          :initiator? init? :now 0
+                          :policy {:rekey-timeout 5}}))]
+     {:a (mk ak bk "judah" true) :b (mk bk ak "asher" false) :ak ak :bk bk})))
 
 (defn- handshake
   "Drive a full session establishment. -> [a b]"
@@ -155,6 +157,61 @@
     (is (peer/should-initiate? "asher" "judah"))
     (is (not (peer/should-initiate? "judah" "asher")))))
 
+(deftest signed-endpoints-bootstrap-a-session-without-a-relay
+  (let [a-endpoint {:kind :local :host "198.51.100.10" :port 41641}
+        b-endpoint {:kind :local :host "198.51.100.20" :port 41641}
+        {:keys [a b]} (pair {"judah" ["198.51.100.20:41641"]
+                             "asher" ["198.51.100.10:41641"]})
+        a-start (peer/tick a {:now-s 100 :now-ms 100000 :local-candidates []
+                              :bootstrap-direct? true})
+        b-start (peer/tick b {:now-s 100 :now-ms 100000 :local-candidates []
+                              :bootstrap-direct? true})
+        a-punch (first (:send a-start))
+        a-init (second (:send a-start))
+        b-punch (first (:send b-start))
+        ignored-punch (peer/on-datagram b {:bytes (:bytes a-punch)
+                                           :now-s 100 :now-ms 100000
+                                           :from-endpoint a-endpoint})
+        accepted-init (peer/on-datagram b {:bytes (:bytes a-init)
+                                           :now-s 100 :now-ms 100000
+                                           :from-endpoint a-endpoint})
+        response (first (:send accepted-init))
+        accepted-response (peer/on-datagram (:state a-start)
+                                            {:bytes (:bytes response)
+                                             :now-s 101 :now-ms 101000
+                                             :from-endpoint b-endpoint})]
+    (is (= :bootstrap-punch (:type (peer/decode-frame (:bytes a-punch))))
+        "the unauthenticated NAT opener is a distinct, non-amplifying frame")
+    (is (= :direct (:route a-init))
+        "the deterministic initiator sends its authenticated Noise IK to signed candidates")
+    (is (= b-endpoint (:endpoint a-init)))
+    (is (= [:bootstrap-punch] (mapv #(-> % :bytes peer/decode-frame :type)
+                                    (:send b-start)))
+        "the responder opens its NAT mapping without initiating a second handshake")
+    (is (empty? (:send ignored-punch)) "a punch never receives a response")
+    (is (peer/established? (:state accepted-init)))
+    (is (= :direct (:route response)) "the signed peer's response follows the direct source")
+    (is (= a-endpoint (:endpoint response)))
+    (is (peer/established? (:state accepted-response)))))
+
+(deftest direct-no-relay-handshakes-only-answer-signed-candidate-sources
+  (let [a-endpoint {:kind :local :host "198.51.100.10" :port 41641}
+        unlisted-endpoint {:kind :local :host "198.51.100.99" :port 41641}
+        {:keys [a b]} (pair {"judah" ["198.51.100.20:41641"]
+                             "asher" ["198.51.100.10:41641"]})
+        [_ init] (peer/dial a 100)
+        rejected (peer/on-datagram b {:bytes (:bytes init)
+                                      :now-s 100 :now-ms 100000
+                                      :from-endpoint unlisted-endpoint})]
+    (is (= :handshake-source-not-authorized
+           (:event (first (:events rejected)))))
+    (is (empty? (:send rejected)))
+    (is (not (peer/established? (:state rejected))))
+    (let [accepted (peer/on-datagram b {:bytes (:bytes init)
+                                        :now-s 100 :now-ms 100000
+                                        :from-endpoint a-endpoint})]
+      (is (= :direct (:route (first (:send accepted))))))))
+
 (deftest an-expired-session-is-dropped-and-redialled
   (let [[a _] (handshake (pair))
         out (peer/tick a {:now-s (+ 100 181) :now-ms 281000 :local-candidates []})]
@@ -163,6 +220,93 @@
     (testing "and the next tick dials again"
       (let [out2 (peer/tick (:state out) {:now-s 282 :now-ms 282000 :local-candidates []})]
         (is (= :dialing (:event (first (:events out2)))))))))
+
+(deftest rekey-keeps-old-session-live-until-new-traffic-arrives
+  (let [[a b] (handshake (pair))
+        ;; Force the initiator's session timer due without changing the default
+        ;; retry and expiry windows used by the rest of the peer tests.
+        a (-> a
+              (assoc-in [:policy :rekey-after-time] 1)
+              (assoc-in [:session :policy :rekey-after-time] 1))
+        old-hash (get-in a [:session :handshake-hash])
+        start (peer/tick a {:now-s 101 :now-ms 101000 :local-candidates []})
+        rekey-init (first (:send start))
+        staged (peer/on-datagram b {:bytes (:bytes rekey-init)
+                                    :now-s 101 :now-ms 101000})]
+    (is (= :rekey-started (:event (first (:events start)))))
+    (is (= :rekey-staged (:event (first (:events staged)))))
+    (is (= old-hash (get-in staged [:state :session :handshake-hash]))
+        "the responder keeps the established session while staging the new one")
+    (let [response (first (:send staged))
+          accepted (peer/on-datagram (:state start) {:bytes (:bytes response)
+                                                     :now-s 102 :now-ms 102000})
+          a' (:state accepted)
+          [b-old old-dg] (peer/send-data (:state staged) (b/utf8-encode "old") 102)
+          old-read (peer/on-datagram a' {:bytes (:bytes old-dg)
+                                         :now-s 102 :now-ms 102000})
+          [_new-dg-state new-dg] (peer/send-data a' (b/utf8-encode "new") 103)
+          new-read (peer/on-datagram b-old {:bytes (:bytes new-dg)
+                                           :now-s 103 :now-ms 103000})
+          b' (:state new-read)]
+      (is (seq (:previous-sessions a'))
+          "the initiator retains the prior receive key during the grace period")
+      (is (= "old" (apply str (map char (:payload (first (:events old-read))))))
+          "an in-flight old-session packet still decrypts after initiator switch")
+      (is (= "new" (apply str (map char (:payload (first (:events new-read))))))
+          "the first new-session packet promotes the responder's staged session")
+      (is (= :rekey-promoted (:event (second (:events new-read)))))
+      (is (= (get-in a' [:session :handshake-hash])
+             (get-in b' [:session :handshake-hash])))
+      (is (seq (:previous-sessions b'))
+          "the responder keeps its old receive key for reordered packets")
+      (is (empty? (:pending-sessions b')))
+      (let [expired-grace (peer/tick b' {:now-s 114 :now-ms 114000 :local-candidates []})]
+        (is (empty? (get-in expired-grace [:state :previous-sessions]))
+            "the old receive key is discarded after the configured grace")))))
+
+(deftest rekey-retries-can-complete-out-of-order
+  (let [[a b] (handshake (pair))
+        a (-> a
+              (assoc-in [:policy :rekey-after-time] 1)
+              (assoc-in [:session :policy :rekey-after-time] 1))
+        start (peer/tick a {:now-s 101 :now-ms 101000 :local-candidates []})
+        ;; The first response is accepted while the second response is delayed.
+        [a retry-init] (peer/dial (:state start) 106)
+        staged1 (peer/on-datagram b {:bytes (:bytes (first (:send start)))
+                                     :now-s 101 :now-ms 101000})
+        staged2 (peer/on-datagram (:state staged1) {:bytes (:bytes retry-init)
+                                                    :now-s 106 :now-ms 106000})
+        response1 (first (:send staged1))
+        response2 (first (:send staged2))
+        accepted1 (peer/on-datagram a {:bytes (:bytes response1)
+                                       :now-s 107 :now-ms 107000})
+        [a1 frame1] (peer/send-data (:state accepted1) (b/utf8-encode "attempt-1") 107)
+        received1 (peer/on-datagram (:state staged2) {:bytes (:bytes frame1)
+                                                      :now-s 107 :now-ms 107000})
+        accepted2 (peer/on-datagram a1 {:bytes (:bytes response2)
+                                       :now-s 108 :now-ms 108000})
+        [_a2 frame2] (peer/send-data (:state accepted2) (b/utf8-encode "attempt-2") 109)
+        received2 (peer/on-datagram (:state received1) {:bytes (:bytes frame2)
+                                                        :now-s 109 :now-ms 109000})]
+    (is (= 2 (count (get-in staged2 [:state :pending-sessions])))
+        "the responder keeps the most recent retry handshakes")
+    (is (= "attempt-1" (apply str (map char (:payload (first (:events received1))))))
+        "the responder can promote whichever valid response arrives first")
+    (is (= :rekey-promoted (:event (second (:events received1)))))
+    (is (= "attempt-2" (apply str (map char (:payload (first (:events received2))))))
+        "a later response can still move both peers to the newer handshake")
+    (is (= :rekey-promoted (:event (second (:events received2)))))
+    (is (= (get-in accepted2 [:state :session :handshake-hash])
+           (get-in received2 [:state :session :handshake-hash])))
+    (is (empty? (get-in received2 [:state :pending-sessions])))))
+
+(deftest an-expired-session-does-not-decrypt-before-the-next-tick
+  (let [[a b] (handshake (pair))
+        [_ dg] (peer/send-data a (b/utf8-encode "too-late") 281)
+        {:keys [events]} (peer/on-datagram b {:bytes (:bytes dg)
+                                             :now-s 281 :now-ms 281000})]
+    (is (= :dropped (:event (first events))))
+    (is (not= :data (:event (first events))))))
 
 (deftest framing-rejects-hostile-input
   (is (= :short-frame (:error (peer/decode-frame [1]))))

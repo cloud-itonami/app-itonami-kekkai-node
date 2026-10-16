@@ -1,0 +1,15 @@
+#!/usr/bin/env kbb
+;; Run the resident node agent with its configured TCP stream forwarders.
+;;
+;;   kbb --classpath "src:..." bin/stream-edge.cljk kekkai-node.edn
+(ns stream-edge-main
+  (:require [kekkai.node.stream-edge :as stream-edge]))
+
+(let [argv (vec (js->clj (.-argv js/process)))
+      script-index (last (keep-indexed
+                          (fn [i arg]
+                            (when (and (string? arg) (.endsWith arg "bin/stream-edge.cljk")) i))
+                          argv))]
+  (when-not (some? script-index)
+    (throw (js/Error. "cannot locate bin/stream-edge.cljk in process arguments")))
+  (apply stream-edge/-main (subvec argv (inc script-index))))

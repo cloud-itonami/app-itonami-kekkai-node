@@ -1,0 +1,15 @@
+#!/usr/bin/env kbb
+;; Run one Kekkai agent with both SSH stream edges and the local packet bridge.
+;;
+;;   kbb --classpath "src:..." bin/node.cljk kekkai-node.edn
+(ns node-main
+  (:require [kekkai.node.runtime :as runtime]))
+
+(let [argv (vec (js->clj (.-argv js/process)))
+      script-index (last (keep-indexed
+                          (fn [i arg]
+                            (when (and (string? arg) (.endsWith arg "bin/node.cljk")) i))
+                          argv))]
+  (when-not (some? script-index)
+    (throw (js/Error. "cannot locate bin/node.cljk in process arguments")))
+  (apply runtime/-main (subvec argv (inc script-index))))
