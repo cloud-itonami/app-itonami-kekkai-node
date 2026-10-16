@@ -117,9 +117,10 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
         }
         let serviceName = Bundle.main.object(forInfoDictionaryKey: "KekkaiMachServiceName") as? String
             ?? "group.jp.kotoba.kekkai.service"
+        let teamIdentifierPrefix = Bundle.main.object(forInfoDictionaryKey: "KekkaiTeamIdentifierPrefix") as? String
         guard let requirement = KekkaiXPCSigningRequirement.make(
             bundleIdentifier: providerBundleIdentifier,
-            machServiceName: serviceName
+            teamIdentifierPrefix: teamIdentifierPrefix
         ) else {
             completion(NSError(domain: "jp.kotoba.kekkai.xpc", code: 9,
                                 userInfo: [NSLocalizedDescriptionKey: "Kekkai signing team is not configured"]))
@@ -133,14 +134,19 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
         connection.invalidationHandler = { [weak self, weak connection] in
             guard let self, let connection else { return }
             self.extensionConnectionLock.lock()
-            if self.extensionConnection === connection {
+            let wasCurrent = self.extensionConnection === connection
+            if wasCurrent {
                 self.extensionConnection = nil
             }
             self.extensionConnectionLock.unlock()
-            self.stopNodeTransport()
+            if wasCurrent { self.stopNodeTransport() }
         }
-        connection.interruptionHandler = { [weak self] in
-            self?.stopNodeTransport()
+        connection.interruptionHandler = { [weak self, weak connection] in
+            guard let self, let connection else { return }
+            self.extensionConnectionLock.lock()
+            let isCurrent = self.extensionConnection === connection
+            self.extensionConnectionLock.unlock()
+            if isCurrent { self.stopNodeTransport() }
         }
         extensionConnectionLock.lock()
         extensionConnection = connection
@@ -162,7 +168,7 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
                 self.extensionConnectionLock.unlock()
                 connection.invalidate()
             }
-            completion(error)
+            DispatchQueue.main.async { completion(error) }
         }
         guard let extensionProxy = connection.remoteObjectProxyWithErrorHandler({ error in
             completeOnce(error)
@@ -268,8 +274,11 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
         extensionConnectionLock.unlock()
         guard let connection else { return nil }
         return connection.remoteObjectProxyWithErrorHandler { [weak self] error in
-            self?.stopNodeTransport()
-            self?.showError("Kekkai system extension connection failed", error)
+            guard let self else { return }
+            self.stopNodeTransport()
+            DispatchQueue.main.async {
+                self.showError("Kekkai system extension connection failed", error)
+            }
         } as? KekkaiTunnelExtensionProtocol
     }
 

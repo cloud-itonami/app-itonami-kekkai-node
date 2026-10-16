@@ -1,11 +1,13 @@
 import Foundation
+import Darwin
 
-final class KekkaiSystemExtensionXPCService: NSObject, NSXPCListenerDelegate, KekkaiTunnelExtensionProtocol {
+final class KekkaiSystemExtensionXPCService: NSObject, NSXPCListenerDelegate {
     static let shared = KekkaiSystemExtensionXPCService()
 
     private let lock = NSLock()
     private let listener: NSXPCListener
     private var connection: NSXPCConnection?
+    private var authenticatedUserID: uid_t?
     private weak var transport: KekkaiXPCTransport?
 
     private override init() {
@@ -14,6 +16,14 @@ final class KekkaiSystemExtensionXPCService: NSObject, NSXPCListenerDelegate, Ke
         listener = NSXPCListener(machServiceName: serviceName)
         super.init()
         listener.delegate = self
+    }
+
+    private var hostCodeSigningRequirement: String? {
+        let teamIdentifierPrefix = Bundle.main.infoDictionary?["KekkaiTeamIdentifierPrefix"] as? String
+        return KekkaiXPCSigningRequirement.make(
+            bundleIdentifier: "jp.kotoba.kekkai",
+            teamIdentifierPrefix: teamIdentifierPrefix
+        )
     }
 
     func start() {
@@ -33,55 +43,78 @@ final class KekkaiSystemExtensionXPCService: NSObject, NSXPCListenerDelegate, Ke
     }
 
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
-        let serviceName = (Bundle.main.infoDictionary?["NetworkExtension"] as? [String: Any])?["NEMachServiceName"] as? String
-        guard let requirement = KekkaiXPCSigningRequirement.make(
-            bundleIdentifier: "jp.kotoba.kekkai",
-            machServiceName: serviceName
-        ) else {
+        guard let requirement = hostCodeSigningRequirement else {
             return false
         }
         newConnection.setCodeSigningRequirement(requirement)
         newConnection.exportedInterface = NSXPCInterface(with: KekkaiTunnelExtensionProtocol.self)
         newConnection.remoteObjectInterface = NSXPCInterface(with: KekkaiTunnelHostProtocol.self)
-        newConnection.exportedObject = self
+        newConnection.exportedObject = KekkaiSystemExtensionHostSession(
+            service: self,
+            connection: newConnection
+        )
         newConnection.invalidationHandler = { [weak self, weak newConnection] in
             guard let self, let newConnection else { return }
             self.connectionEnded(newConnection)
         }
-        newConnection.interruptionHandler = { [weak self] in
-            self?.failActiveTransport(NSError(
-                domain: "jp.kotoba.kekkai.xpc", code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Kekkai host IPC was interrupted"]))
+        newConnection.interruptionHandler = { [weak self, weak newConnection] in
+            guard let self, let newConnection else { return }
+            self.connectionInterrupted(newConnection)
         }
-
-        lock.lock()
-        let previous = connection
-        connection = newConnection
-        lock.unlock()
-        previous?.invalidate()
         newConnection.resume()
         return true
     }
 
-    func ping(withReply reply: @escaping (Bool) -> Void) {
+    fileprivate func authenticateAndPromote(_ candidate: NSXPCConnection, withReply reply: @escaping (Bool) -> Void) {
+        guard let userID = userID(for: candidate.processIdentifier) else {
+            reply(false)
+            return
+        }
+
+        lock.lock()
+        if let authenticatedUserID, authenticatedUserID != userID {
+            lock.unlock()
+            reply(false)
+            return
+        }
+        let previous = connection
+        connection = candidate
+        authenticatedUserID = userID
+        lock.unlock()
+
+        // The candidate reaches this method only after its code-signing requirement
+        // permits the ping. Do not evict the live peer until that authenticated
+        // handshake succeeds.
+        if previous !== candidate { previous?.invalidate() }
         reply(true)
     }
 
-    func receivePacketFromNode(_ packet: Data, family: Int32) {
+    fileprivate func isCurrent(_ candidate: NSXPCConnection?) -> Bool {
+        guard let candidate else { return false }
+        lock.lock()
+        let current = connection === candidate
+        lock.unlock()
+        return current
+    }
+
+    fileprivate func receivePacketFromNode(_ packet: Data, family: Int32, from candidate: NSXPCConnection?) {
+        guard isCurrent(candidate) else { return }
         lock.lock()
         let transport = self.transport
         lock.unlock()
         transport?.receiveFromNode(packet, family: family)
     }
 
-    func receiveUnderlayFromNode(_ snapshot: Data) {
+    fileprivate func receiveUnderlayFromNode(_ snapshot: Data, from candidate: NSXPCConnection?) {
+        guard isCurrent(candidate) else { return }
         lock.lock()
         let transport = self.transport
         lock.unlock()
         transport?.receiveUnderlayFromNode(snapshot)
     }
 
-    func packetBridgeFailed(_ message: String) {
+    fileprivate func packetBridgeFailed(_ message: String, from candidate: NSXPCConnection?) {
+        guard isCurrent(candidate) else { return }
         failActiveTransport(NSError(
             domain: "jp.kotoba.kekkai.bridge", code: 1,
             userInfo: [NSLocalizedDescriptionKey: message]))
@@ -135,11 +168,40 @@ final class KekkaiSystemExtensionXPCService: NSObject, NSXPCListenerDelegate, Ke
 
     private func connectionEnded(_ ended: NSXPCConnection) {
         lock.lock()
-        if connection === ended { connection = nil }
+        let wasCurrent = connection === ended
+        if wasCurrent {
+            connection = nil
+            authenticatedUserID = nil
+        }
         lock.unlock()
+        guard wasCurrent else { return }
         failActiveTransport(NSError(
             domain: "jp.kotoba.kekkai.xpc", code: 4,
             userInfo: [NSLocalizedDescriptionKey: "Kekkai host app disconnected"]))
+    }
+
+    private func userID(for processIdentifier: pid_t) -> uid_t? {
+        guard processIdentifier > 0 else { return nil }
+        var info = proc_bsdinfo()
+        let result = proc_pidinfo(
+            processIdentifier,
+            PROC_PIDTBSDINFO,
+            0,
+            &info,
+            Int32(MemoryLayout<proc_bsdinfo>.size)
+        )
+        guard result == MemoryLayout<proc_bsdinfo>.size else { return nil }
+        return info.pbi_uid
+    }
+
+    private func connectionInterrupted(_ interrupted: NSXPCConnection) {
+        lock.lock()
+        let isCurrent = connection === interrupted
+        lock.unlock()
+        guard isCurrent else { return }
+        failActiveTransport(NSError(
+            domain: "jp.kotoba.kekkai.xpc", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Kekkai host IPC was interrupted"]))
     }
 
     private func failActiveTransport(_ error: Error) {
@@ -147,5 +209,35 @@ final class KekkaiSystemExtensionXPCService: NSObject, NSXPCListenerDelegate, Ke
         let transport = self.transport
         lock.unlock()
         transport?.fail(error)
+    }
+}
+
+private final class KekkaiSystemExtensionHostSession: NSObject, KekkaiTunnelExtensionProtocol {
+    private weak var service: KekkaiSystemExtensionXPCService?
+    private weak var connection: NSXPCConnection?
+
+    init(service: KekkaiSystemExtensionXPCService, connection: NSXPCConnection) {
+        self.service = service
+        self.connection = connection
+    }
+
+    func ping(withReply reply: @escaping (Bool) -> Void) {
+        guard let service, let connection else {
+            reply(false)
+            return
+        }
+        service.authenticateAndPromote(connection, withReply: reply)
+    }
+
+    func receivePacketFromNode(_ packet: Data, family: Int32) {
+        service?.receivePacketFromNode(packet, family: family, from: connection)
+    }
+
+    func receiveUnderlayFromNode(_ snapshot: Data) {
+        service?.receiveUnderlayFromNode(snapshot, from: connection)
+    }
+
+    func packetBridgeFailed(_ message: String) {
+        service?.packetBridgeFailed(message, from: connection)
     }
 }

@@ -7,10 +7,12 @@
   <string>Kekkai Packet Tunnel</string>
   <key>CFBundlePackageType</key>
   <string>SYSX</string>
+  <key>KekkaiTeamIdentifierPrefix</key>
+  <string>$(TeamIdentifierPrefix)</string>
   <key>NetworkExtension</key>
   <dict>
     <key>NEMachServiceName</key>
-    <string>$(TeamIdentifierPrefix)group.jp.kotoba.kekkai.service</string>
+    <string>group.jp.kotoba.kekkai.service</string>
     <key>NEProviderClasses</key>
     <dict>
       <key>com.apple.networkextension.packet-tunnel</key>
