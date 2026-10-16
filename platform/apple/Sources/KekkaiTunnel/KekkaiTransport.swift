@@ -60,25 +60,3 @@ public extension KekkaiPacketTransport {
     func acknowledgeUnderlay(addresses: [String]) {}
     func releaseUnderlayGuard(completion: @escaping () -> Void) { completion() }
 }
-
-public enum KekkaiTransportFactory {
-    private static let lock = NSLock()
-    private static var builder: (() -> KekkaiPacketTransport)?
-
-    /// A native Kekkai runtime can install a direct transport before the
-    /// provider starts. Otherwise the provider connects to the local
-    /// kekkai-node packet bridge; it never opens an unauthenticated UDP path.
-    public static func install(_ value: @escaping () -> KekkaiPacketTransport) {
-        lock.lock()
-        defer { lock.unlock() }
-        precondition(builder == nil, "Kekkai transport factory already installed")
-        builder = value
-    }
-
-    static func make() -> KekkaiPacketTransport {
-        lock.lock()
-        let installedBuilder = builder
-        lock.unlock()
-        return installedBuilder?() ?? KekkaiLocalNodeTransport()
-    }
-}

@@ -13,6 +13,9 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
     private var extensionRequest: OSSystemExtensionRequest?
     private var extensionActivationCompletion: ((Error?) -> Void)?
     private var extensionApprovalPending = false
+    private var extensionConnection: NSXPCConnection?
+    private let bridgeLock = NSLock()
+    private var nodeTransport: KekkaiLocalNodeTransport?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -32,6 +35,10 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
         if let statusObserver {
             NotificationCenter.default.removeObserver(statusObserver)
         }
+        manager?.connection.stopVPNTunnel()
+        stopNodeTransport()
+        extensionConnection?.invalidate()
+        extensionConnection = nil
     }
 
     @objc private func connect(_ sender: Any?) {
@@ -41,9 +48,16 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
                 self.showError("Could not activate the Kekkai system extension", error)
                 return
             }
-            self.loadManager { [weak self] in
-                guard let self, let manager = self.manager else { return }
-                self.configureAndStartTunnel(manager)
+            self.connectToSystemExtension { [weak self] connectionError in
+                guard let self else { return }
+                if let connectionError {
+                    self.showError("Could not connect to the Kekkai system extension", connectionError)
+                    return
+                }
+                self.loadManager { [weak self] in
+                    guard let self, let manager = self.manager else { return }
+                    self.configureAndStartTunnel(manager)
+                }
             }
         }
     }
@@ -87,6 +101,168 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
                 }
             }
         }
+    }
+
+    private func connectToSystemExtension(completion: @escaping (Error?) -> Void) {
+        if extensionConnection != nil {
+            completion(nil)
+            return
+        }
+        let serviceName = Bundle.main.object(forInfoDictionaryKey: "KekkaiMachServiceName") as? String
+            ?? "group.jp.kotoba.kekkai.service"
+        guard let requirement = KekkaiXPCSigningRequirement.make(
+            bundleIdentifier: providerBundleIdentifier,
+            machServiceName: serviceName
+        ) else {
+            completion(NSError(domain: "jp.kotoba.kekkai.xpc", code: 9,
+                                userInfo: [NSLocalizedDescriptionKey: "Kekkai signing team is not configured"]))
+            return
+        }
+        let connection = NSXPCConnection(machServiceName: serviceName, options: .privileged)
+        connection.setCodeSigningRequirement(requirement)
+        connection.remoteObjectInterface = NSXPCInterface(with: KekkaiTunnelExtensionProtocol.self)
+        connection.exportedInterface = NSXPCInterface(with: KekkaiTunnelHostProtocol.self)
+        connection.exportedObject = self
+        connection.invalidationHandler = { [weak self, weak connection] in
+            guard let self, let connection else { return }
+            if self.extensionConnection === connection {
+                self.extensionConnection = nil
+            }
+            self.stopNodeTransport()
+        }
+        connection.interruptionHandler = { [weak self] in
+            self?.stopNodeTransport()
+        }
+        extensionConnection = connection
+        connection.resume()
+        let completionLock = NSLock()
+        var didComplete = false
+        let completeOnce: (Error?) -> Void = { [weak self, weak connection] error in
+            completionLock.lock()
+            guard !didComplete else {
+                completionLock.unlock()
+                return
+            }
+            didComplete = true
+            completionLock.unlock()
+            if error != nil, let self, let connection {
+                if self.extensionConnection === connection { self.extensionConnection = nil }
+                connection.invalidate()
+            }
+            completion(error)
+        }
+        guard let extensionProxy = connection.remoteObjectProxyWithErrorHandler({ error in
+            completeOnce(error)
+        }) as? KekkaiTunnelExtensionProtocol else {
+            completeOnce(NSError(domain: "jp.kotoba.kekkai.xpc", code: 10,
+                                  userInfo: [NSLocalizedDescriptionKey: "Kekkai system extension proxy is unavailable"]))
+            return
+        }
+        extensionProxy.ping { available in
+            completeOnce(available ? nil : NSError(
+                domain: "jp.kotoba.kekkai.xpc", code: 11,
+                userInfo: [NSLocalizedDescriptionKey: "Kekkai system extension did not become ready"]))
+        }
+    }
+
+    func startPacketBridge(configuration: Data, withReply reply: @escaping (NSError?) -> Void) {
+        guard let configuration = try? JSONSerialization.jsonObject(with: configuration) as? [String: Any] else {
+            reply(NSError(domain: "jp.kotoba.kekkai.bridge", code: 12,
+                          userInfo: [NSLocalizedDescriptionKey: "Kekkai packet bridge configuration is invalid"]))
+            return
+        }
+        bridgeLock.lock()
+        guard nodeTransport == nil else {
+            bridgeLock.unlock()
+            reply(NSError(domain: "jp.kotoba.kekkai.bridge", code: 13,
+                          userInfo: [NSLocalizedDescriptionKey: "Kekkai packet bridge is already running"]))
+            return
+        }
+        let transport = KekkaiLocalNodeTransport()
+        nodeTransport = transport
+        bridgeLock.unlock()
+
+        transport.start(
+            configuration: configuration,
+            receive: { [weak self] packet, family in
+                self?.extensionProxy()?.receivePacketFromNode(packet, family: family.int32Value)
+            },
+            underlay: { [weak self] snapshot in
+                guard let self,
+                      let data = try? JSONSerialization.data(withJSONObject: [
+                        "ready": snapshot.ready,
+                        "addresses": snapshot.addresses,
+                        "routes": snapshot.routes.map { [
+                            "family": Int($0.family),
+                            "prefix": $0.prefix,
+                            "prefixLength": $0.prefixLength
+                        ] as [String: Any] }
+                      ]) else { return }
+                self.extensionProxy()?.receiveUnderlayFromNode(data)
+            },
+            failure: { [weak self] error in
+                self?.extensionProxy()?.packetBridgeFailed(error.localizedDescription)
+            },
+            completion: { error in reply(error as NSError?) })
+    }
+
+    func sendPacketToNode(_ packet: Data, family: Int32, withReply reply: @escaping (NSError?) -> Void) {
+        bridgeLock.lock()
+        let transport = nodeTransport
+        bridgeLock.unlock()
+        guard let transport else {
+            reply(NSError(domain: "jp.kotoba.kekkai.bridge", code: 14,
+                          userInfo: [NSLocalizedDescriptionKey: "Kekkai node socket is not connected"]))
+            return
+        }
+        transport.send(packet: packet, protocolFamily: NSNumber(value: family)) { error in
+            reply(error as NSError?)
+        }
+    }
+
+    func acknowledgeUnderlay(_ addresses: [String], withReply reply: @escaping (NSError?) -> Void) {
+        bridgeLock.lock()
+        let transport = nodeTransport
+        bridgeLock.unlock()
+        guard let transport else {
+            reply(NSError(domain: "jp.kotoba.kekkai.bridge", code: 15,
+                          userInfo: [NSLocalizedDescriptionKey: "Kekkai node socket is not connected"]))
+            return
+        }
+        transport.acknowledgeUnderlay(addresses: addresses)
+        reply(nil)
+    }
+
+    func releaseUnderlayGuard(withReply reply: @escaping (NSError?) -> Void) {
+        bridgeLock.lock()
+        let transport = nodeTransport
+        bridgeLock.unlock()
+        guard let transport else {
+            reply(nil)
+            return
+        }
+        transport.releaseUnderlayGuard { reply(nil) }
+    }
+
+    func stopPacketBridge(withReply reply: @escaping (NSError?) -> Void) {
+        stopNodeTransport()
+        reply(nil)
+    }
+
+    private func extensionProxy() -> KekkaiTunnelExtensionProtocol? {
+        guard let extensionConnection else { return nil }
+        return extensionConnection.remoteObjectProxyWithErrorHandler { [weak self] error in
+            self?.stopNodeTransport()
+            self?.showError("Kekkai system extension connection failed", error)
+        } as? KekkaiTunnelExtensionProtocol
+    }
+
+    private func stopNodeTransport() {
+        bridgeLock.lock()
+        let transport = nodeTransport
+        nodeTransport = nil
+        bridgeLock.unlock()
+        transport?.stop()
     }
 
     private func activateSystemExtension(completion: @escaping (Error?) -> Void) {
@@ -165,7 +341,7 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
         }
         let alert = NSAlert()
         alert.messageText = "Kekkai packet bridge"
-        alert.informativeText = "Set the Kekkai node's :packet-bridge :path to the same socket path."
+        alert.informativeText = "Set the Kekkai node's :packet-bridge :path to this socket. The host app bridges it to the system extension over XPC."
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
         let field = NSTextField(string: currentSocketPath()

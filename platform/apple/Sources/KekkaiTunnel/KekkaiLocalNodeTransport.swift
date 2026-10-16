@@ -2,10 +2,11 @@ import Darwin
 import Foundation
 import Network
 
-/// PacketTunnelProvider adapter for the local framed socket served by
-/// `kekkai.node.packet-bridge`. The Node process owns signed-netmap checks,
-/// Noise sessions, direct/relay selection, and revocation; this class only
-/// moves bounded raw-IP frames between NetworkExtension and that agent.
+/// User-context host adapter for the local framed socket served by
+/// `kekkai.node.packet-bridge`. The menu-bar app owns this connection and
+/// relays bounded frames to the global system extension over XPC. The Node
+/// process owns signed-netmap checks, Noise sessions, route selection, and
+/// revocation.
 public final class KekkaiLocalNodeTransport: KekkaiPacketTransport {
     private enum BridgeError: LocalizedError {
         case missingSocketPath

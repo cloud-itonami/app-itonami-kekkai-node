@@ -9,6 +9,8 @@
   <string>SYSX</string>
   <key>NetworkExtension</key>
   <dict>
+    <key>NEMachServiceName</key>
+    <string>$(TeamIdentifierPrefix)group.jp.kotoba.kekkai.service</string>
     <key>NEProviderClasses</key>
     <dict>
       <key>com.apple.networkextension.packet-tunnel</key>
