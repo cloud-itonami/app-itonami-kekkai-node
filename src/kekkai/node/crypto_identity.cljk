@@ -1,0 +1,69 @@
+(ns kekkai.node.crypto-identity
+  "Node-native Ed25519 signing and did:key derivation for the resident agent.
+
+  The shared JVM library uses Java byte-array interop that is unavailable in
+  the Node/KBB runtime. Node's crypto module consumes the same raw 32-byte
+  Ed25519 seed and emits the same deterministic RFC 8032 signatures."
+  (:require ["node:crypto" :as crypto]))
+
+(def ^:private alphabet "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+(def ^:private ed25519-public-prefix (.from js/Buffer "ed01" "hex"))
+(def ^:private ed25519-pkcs8-prefix (.from js/Buffer "302e020100300506032b657004220420" "hex"))
+
+(defn unhex [value]
+  (when-not (and (string? value)
+                 (even? (count value))
+                 (re-matches #"(?i)[0-9a-f]*" value))
+    (throw (ex-info "value must be an even-length hexadecimal string"
+                    {:type :kekkai/invalid-hex})))
+  (.from js/Buffer value "hex"))
+
+(defn- bytes-buffer [value]
+  (if (vector? value)
+    (.from js/Buffer (clj->js value))
+    (.from js/Buffer value)))
+
+(defn hexify [value]
+  (.toString (bytes-buffer value) "hex"))
+
+(defn- private-key [seed]
+  (let [raw (bytes-buffer seed)]
+    (when-not (= 32 (.-length raw))
+      (throw (ex-info "Ed25519 seed must contain 32 bytes"
+                      {:type :kekkai/invalid-ed25519-seed})))
+    (.createPrivateKey crypto
+                       #js {:key (.concat js/Buffer
+                                          #js [ed25519-pkcs8-prefix raw])
+                            :format "der" :type "pkcs8"})))
+
+(defn- base58-encode [raw]
+  (let [values (vec (array-seq raw))
+        leading-zeros (count (take-while zero? values))
+        digits
+        (reduce
+         (fn [digits byte]
+           (loop [index (dec (count digits))
+                  digits digits
+                  carry byte]
+             (if (>= index 0)
+               (let [value (+ (* (nth digits index) 256) carry)]
+                 (recur (dec index) (assoc digits index (mod value 58))
+                        (quot value 58)))
+               (loop [digits digits carry carry]
+                 (if (pos? carry)
+                   (recur (into [(mod carry 58)] digits) (quot carry 58))
+                   digits)))))
+         [] (drop leading-zeros values))]
+    (str (apply str (repeat leading-zeros "1"))
+         (apply str (map #(.charAt alphabet %) digits)))))
+
+(defn did-key-from-seed [seed]
+  (let [private-key (private-key seed)
+        spki (.export (.createPublicKey crypto private-key)
+                      #js {:format "der" :type "spki"})
+        raw-public (.subarray spki (- (.-length spki) 32))
+        multikey (.concat js/Buffer #js [ed25519-public-prefix raw-public])]
+    (str "did:key:z" (base58-encode multikey))))
+
+(defn sign [seed message]
+  (.sign crypto nil (bytes-buffer message) (private-key seed)))
