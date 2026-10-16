@@ -13,6 +13,7 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
     private var extensionRequest: OSSystemExtensionRequest?
     private var extensionActivationCompletion: ((Error?) -> Void)?
     private var extensionApprovalPending = false
+    private let extensionConnectionLock = NSLock()
     private var extensionConnection: NSXPCConnection?
     private let bridgeLock = NSLock()
     private var nodeTransport: KekkaiLocalNodeTransport?
@@ -37,8 +38,11 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
         }
         manager?.connection.stopVPNTunnel()
         stopNodeTransport()
+        extensionConnectionLock.lock()
+        let extensionConnection = self.extensionConnection
+        self.extensionConnection = nil
+        extensionConnectionLock.unlock()
         extensionConnection?.invalidate()
-        extensionConnection = nil
     }
 
     @objc private func connect(_ sender: Any?) {
@@ -104,7 +108,10 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
     }
 
     private func connectToSystemExtension(completion: @escaping (Error?) -> Void) {
-        if extensionConnection != nil {
+        extensionConnectionLock.lock()
+        let existingConnection = extensionConnection
+        extensionConnectionLock.unlock()
+        if existingConnection != nil {
             completion(nil)
             return
         }
@@ -125,15 +132,19 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
         connection.exportedObject = self
         connection.invalidationHandler = { [weak self, weak connection] in
             guard let self, let connection else { return }
+            self.extensionConnectionLock.lock()
             if self.extensionConnection === connection {
                 self.extensionConnection = nil
             }
+            self.extensionConnectionLock.unlock()
             self.stopNodeTransport()
         }
         connection.interruptionHandler = { [weak self] in
             self?.stopNodeTransport()
         }
+        extensionConnectionLock.lock()
         extensionConnection = connection
+        extensionConnectionLock.unlock()
         connection.resume()
         let completionLock = NSLock()
         var didComplete = false
@@ -146,7 +157,9 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
             didComplete = true
             completionLock.unlock()
             if error != nil, let self, let connection {
+                self.extensionConnectionLock.lock()
                 if self.extensionConnection === connection { self.extensionConnection = nil }
+                self.extensionConnectionLock.unlock()
                 connection.invalidate()
             }
             completion(error)
@@ -250,8 +263,11 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
     }
 
     private func extensionProxy() -> KekkaiTunnelExtensionProtocol? {
-        guard let extensionConnection else { return nil }
-        return extensionConnection.remoteObjectProxyWithErrorHandler { [weak self] error in
+        extensionConnectionLock.lock()
+        let connection = extensionConnection
+        extensionConnectionLock.unlock()
+        guard let connection else { return nil }
+        return connection.remoteObjectProxyWithErrorHandler { [weak self] error in
             self?.stopNodeTransport()
             self?.showError("Kekkai system extension connection failed", error)
         } as? KekkaiTunnelExtensionProtocol
