@@ -181,9 +181,7 @@ final class KekkaiSystemExtensionXPCService: NSObject, NSXPCListenerDelegate {
             completion()
         }
         guard let proxy = connection.remoteObjectProxyWithErrorHandler({ [weak self, weak connection] error in
-            if let self, let connection, self.isCurrent(connection) {
-                self.failActiveTransport(error)
-            }
+            if let self, self.isCurrent(connection) { self.failActiveTransport(error) }
             completeOnce()
         }) as? KekkaiTunnelHostProtocol else {
             completeOnce()

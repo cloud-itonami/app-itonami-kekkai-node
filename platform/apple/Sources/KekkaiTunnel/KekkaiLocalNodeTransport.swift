@@ -48,6 +48,8 @@ public final class KekkaiLocalNodeTransport: KekkaiPacketTransport {
     private var startCompleted = false
     private var receiveStarted = false
     private var stopped = false
+    private var stopFinished = false
+    private var stopCompletions: [() -> Void] = []
     private var terminalFailure = false
 
     public var ready: Bool {
@@ -92,6 +94,8 @@ public final class KekkaiLocalNodeTransport: KekkaiPacketTransport {
             self.startCompleted = false
             self.receiveStarted = false
             self.stopped = false
+            self.stopFinished = false
+            self.stopCompletions.removeAll(keepingCapacity: false)
             self.terminalFailure = false
             self.input.removeAll(keepingCapacity: false)
 
@@ -142,9 +146,19 @@ public final class KekkaiLocalNodeTransport: KekkaiPacketTransport {
 
     public func stop(completion: @escaping () -> Void) {
         queue.async {
+            self.stopCompletions.append(completion)
+            if self.stopFinished {
+                let completions = self.stopCompletions
+                self.stopCompletions.removeAll(keepingCapacity: false)
+                completions.forEach { $0() }
+                return
+            }
+            guard !self.stopped else { return }
             self.stopped = true
             self.setReady(false)
+            let startCompletion = self.startCompletion
             self.startCompletion = nil
+            startCompletion?(BridgeError.disconnected)
             self.startupTimeout?.cancel()
             self.startupTimeout = nil
             self.receiveHandler = nil
@@ -152,19 +166,12 @@ public final class KekkaiLocalNodeTransport: KekkaiPacketTransport {
             self.failureHandler = nil
             self.input.removeAll(keepingCapacity: false)
             let connection = self.connection
-            self.connection = nil
             guard let connection else {
-                completion()
+                self.finishStop()
                 return
             }
-            if case .cancelled = connection.state {
-                completion()
-                return
-            }
-            connection.stateUpdateHandler = { [weak connection] state in
-                guard case .cancelled = state else { return }
-                connection?.stateUpdateHandler = nil
-                completion()
+            connection.stateUpdateHandler = { [self] state in
+                if case .cancelled = state { finishStop() }
             }
             connection.cancel()
         }
@@ -220,10 +227,24 @@ public final class KekkaiLocalNodeTransport: KekkaiPacketTransport {
         case .failed(let error):
             fail(error)
         case .cancelled:
-            if !stopped { fail(BridgeError.disconnected) }
+            if stopped {
+                finishStop()
+            } else {
+                fail(BridgeError.disconnected)
+            }
         default:
             break
         }
+    }
+
+    private func finishStop() {
+        guard !stopFinished else { return }
+        stopFinished = true
+        connection?.stateUpdateHandler = nil
+        connection = nil
+        let completions = stopCompletions
+        stopCompletions.removeAll(keepingCapacity: false)
+        completions.forEach { $0() }
     }
 
     private func receiveNext() {
