@@ -170,6 +170,10 @@ public final class KekkaiLocalNodeTransport: KekkaiPacketTransport {
                 self.finishStop()
                 return
             }
+            if case .cancelled = connection.state {
+                self.finishStop()
+                return
+            }
             connection.stateUpdateHandler = { [self] state in
                 if case .cancelled = state { finishStop() }
             }
