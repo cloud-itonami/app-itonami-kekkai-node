@@ -1,14 +1,18 @@
 import AppKit
 import NetworkExtension
+import SystemExtensions
 
 @NSApplicationMain
-final class KekkaiTunnelHost: NSObject, NSApplicationDelegate {
+final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtensionRequestDelegate {
     private let providerBundleIdentifier = "jp.kotoba.kekkai.tunnel"
     private let socketDefaultsKey = "packetBridgePath"
     private let appGroupIdentifier = "group.jp.kotoba.kekkai"
     private var statusItem: NSStatusItem!
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
+    private var extensionRequest: OSSystemExtensionRequest?
+    private var extensionActivationCompletion: ((Error?) -> Void)?
+    private var extensionApprovalPending = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -31,47 +35,122 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate {
     }
 
     @objc private func connect(_ sender: Any?) {
-        loadManager { [weak self] in
-            guard let self, let manager = self.manager else { return }
-            let tunnel = NETunnelProviderProtocol()
-            tunnel.providerBundleIdentifier = self.providerBundleIdentifier
-            tunnel.serverAddress = "Kekkai"
-            guard let socketPath = self.currentSocketPath() else {
-                self.showError("Configure a packet socket inside the Kekkai shared container", nil)
+        activateSystemExtension { [weak self] error in
+            guard let self else { return }
+            if let error {
+                self.showError("Could not activate the Kekkai system extension", error)
                 return
             }
-            tunnel.providerConfiguration = [
-                "packetBridgePath": socketPath,
-                "mtu": 1280
-            ]
-            manager.protocolConfiguration = tunnel
-            manager.localizedDescription = "Kekkai"
-            manager.isEnabled = true
-            manager.saveToPreferences { [weak self, weak manager] error in
-                DispatchQueue.main.async {
-                    guard let self else { return }
-                    if let error {
-                        self.showError("Could not save the Kekkai VPN profile", error)
-                        return
-                    }
-                    guard let manager else { return }
-                    manager.loadFromPreferences { error in
-                        DispatchQueue.main.async {
-                            if let error {
-                                self.showError("Could not load the Kekkai VPN profile", error)
-                            } else {
-                                do {
-                                    try manager.connection.startVPNTunnel()
-                                } catch {
-                                    self.showError("Could not start the Kekkai tunnel", error)
-                                }
+            self.loadManager { [weak self] in
+                guard let self, let manager = self.manager else { return }
+                self.configureAndStartTunnel(manager)
+            }
+        }
+    }
+
+    private func configureAndStartTunnel(_ manager: NETunnelProviderManager) {
+        let tunnel = NETunnelProviderProtocol()
+        tunnel.providerBundleIdentifier = providerBundleIdentifier
+        tunnel.serverAddress = "Kekkai"
+        guard let socketPath = currentSocketPath() else {
+            showError("Configure a packet socket inside the Kekkai shared container", nil)
+            return
+        }
+        tunnel.providerConfiguration = [
+            "packetBridgePath": socketPath,
+            "mtu": 1280
+        ]
+        manager.protocolConfiguration = tunnel
+        manager.localizedDescription = "Kekkai"
+        manager.isEnabled = true
+        manager.saveToPreferences { [weak self, weak manager] error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let error {
+                    self.showError("Could not save the Kekkai VPN profile", error)
+                    return
+                }
+                guard let manager else { return }
+                manager.loadFromPreferences { error in
+                    DispatchQueue.main.async {
+                        if let error {
+                            self.showError("Could not load the Kekkai VPN profile", error)
+                        } else {
+                            do {
+                                try manager.connection.startVPNTunnel()
+                            } catch {
+                                self.showError("Could not start the Kekkai tunnel", error)
                             }
-                            self.refreshMenu()
                         }
+                        self.refreshMenu()
                     }
                 }
             }
         }
+    }
+
+    private func activateSystemExtension(completion: @escaping (Error?) -> Void) {
+        guard extensionActivationCompletion == nil else {
+            completion(NSError(
+                domain: "jp.kotoba.kekkai.tunnel", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Kekkai extension activation is already in progress"]))
+            return
+        }
+        extensionActivationCompletion = completion
+        let request = OSSystemExtensionRequest.activationRequest(
+            forExtensionWithIdentifier: providerBundleIdentifier,
+            queue: .main
+        )
+        request.delegate = self
+        extensionRequest = request
+        OSSystemExtensionManager.shared.submitRequest(request)
+    }
+
+    func requestNeedsUserApproval(_ request: OSSystemExtensionRequest) {
+        guard request.identifier == providerBundleIdentifier else { return }
+        extensionApprovalPending = true
+        refreshMenu()
+    }
+
+    func request(
+        _ request: OSSystemExtensionRequest,
+        actionForReplacingExtension existing: OSSystemExtensionProperties,
+        withExtension extensionProperties: OSSystemExtensionProperties
+    ) -> OSSystemExtensionRequest.ReplacementAction {
+        .replace
+    }
+
+    func request(
+        _ request: OSSystemExtensionRequest,
+        didFinishWithResult result: OSSystemExtensionRequest.Result
+    ) {
+        guard request.identifier == providerBundleIdentifier else { return }
+        switch result {
+        case .completed:
+            finishSystemExtensionActivation(nil)
+        case .willCompleteAfterReboot:
+            finishSystemExtensionActivation(NSError(
+                domain: "jp.kotoba.kekkai.tunnel", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Restart macOS before connecting the Kekkai tunnel"]))
+        @unknown default:
+            finishSystemExtensionActivation(NSError(
+                domain: "jp.kotoba.kekkai.tunnel", code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "Kekkai extension activation returned an unknown result"]))
+        }
+    }
+
+    func request(_ request: OSSystemExtensionRequest, didFailWithError error: Error) {
+        guard request.identifier == providerBundleIdentifier else { return }
+        finishSystemExtensionActivation(error)
+    }
+
+    private func finishSystemExtensionActivation(_ error: Error?) {
+        extensionApprovalPending = false
+        extensionRequest = nil
+        let completion = extensionActivationCompletion
+        extensionActivationCompletion = nil
+        refreshMenu()
+        completion?(error)
     }
 
     @objc private func disconnect(_ sender: Any?) {
@@ -145,11 +224,15 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate {
         guard let statusItem else { return }
         let status = manager?.connection.status ?? .disconnected
         let label: String
-        switch status {
-        case .connected: label = "Kekkai: Connected"
-        case .connecting, .reasserting: label = "Kekkai: Connecting…"
-        case .disconnecting: label = "Kekkai: Disconnecting…"
-        default: label = "Kekkai: Disconnected"
+        if extensionApprovalPending {
+            label = "Kekkai: Approve in System Settings"
+        } else {
+            switch status {
+            case .connected: label = "Kekkai: Connected"
+            case .connecting, .reasserting: label = "Kekkai: Connecting…"
+            case .disconnecting: label = "Kekkai: Disconnecting…"
+            default: label = "Kekkai: Disconnected"
+            }
         }
         statusItem.button?.title = label
 

@@ -6,7 +6,7 @@
   <key>CFBundleDisplayName</key>
   <string>Kekkai Packet Tunnel</string>
   <key>CFBundlePackageType</key>
-  <string>XPC!</string>
+  <string>SYSX</string>
   <key>NSExtension</key>
   <dict>
     <key>NSExtensionPointIdentifier</key>

@@ -83,17 +83,25 @@ peer identity, route grants, and relay/direct selection. A missing bridge fails
 tunnel startup, and a later bridge failure cancels the tunnel rather than
 routing packets outside it.
 
-`platform/apple/project.yml` generates a macOS menu-bar host app and embeds the
-Packet Tunnel app extension. The host can save/load the VPN profile, connect or
-disconnect, and configure the shared socket path. Both targets carry the
-`group.jp.kotoba.kekkai` app-group entitlement; the extension also carries the
-Packet Tunnel and outbound-network entitlements. Set the Kekkai node's
-`:packet-bridge :path` to the same socket path shown in the host app. The app
-group must be registered for the App ID and included in the signing profile.
-The Kekkai-node process that creates the socket must also be authorized to use
-that group container; the extension's entitlement does not grant access to a
-separate CLI process. Package the node launcher as a signed group member, or
-verify the supported macOS user-authorization path for the exact launcher.
+`platform/apple/project.yml` generates a macOS menu-bar host app and embeds
+`jp.kotoba.kekkai.tunnel.systemextension` in
+`Contents/Library/SystemExtensions`. The system-extension form supports direct
+macOS distribution; the Packet Tunnel app-extension form is App Store only.
+The host requests system-extension activation when the operator clicks
+Connect, then saves/loads the VPN profile and configures the shared socket
+path. macOS may require an administrator to approve the extension in System
+Settings. The host and extension must use the same Team ID and matching
+provisioning profiles. The host needs the System Extension install entitlement
+and `NSSystemExtensionUsageDescription`; the extension needs the
+`packet-tunnel-provider-systemextension` Network Extension entitlement. Both
+targets carry the `group.jp.kotoba.kekkai` app-group entitlement. Set the
+Kekkai node's `:packet-bridge :path` to the same socket path shown in the host
+app. The app group must be registered for both App IDs and included in both
+signing profiles. The Kekkai-node process that creates the socket must also be
+authorized to use that group container; the extension's entitlement does not
+grant access to a separate CLI process. Package the node launcher as a signed
+group member, or verify the supported macOS user-authorization path for the
+exact launcher.
 
 Build an arm64 app and extension without a Developer ID signature or provisioning profile with:
 
@@ -109,9 +117,12 @@ xcodebuild -project KekkaiTunnel.xcodeproj -scheme KekkaiTunnelHost \
 ```
 
 The extension target's build phase compiles and links the macOS Kotoba packet
-plane. This build proves the app and extension compile together; it does not
-prove the signed extension can access the daemon socket or run as an active VPN
-provider.
+plane. This build proves the host app and system extension compile and embed
+together; it does not prove the signed extension can activate, access the daemon
+socket, or run as an active VPN provider. A system extension must be signed with
+the matching Apple Developer identity and provisioning profile, be installed
+with the host app under `/Applications`, and receive the required macOS approval
+before runtime testing.
 
 This local bridge is a host IPC boundary, not the overlay transport itself. The
 macOS Network Extension sandbox, socket ownership/permissions, signed extension

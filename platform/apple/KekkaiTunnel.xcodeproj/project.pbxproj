@@ -10,11 +10,13 @@
 		2AC9D42DEA24975533393559 /* KekkaiTunnelHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79A430CFB65B6F0E84CED273 /* KekkaiTunnelHost.swift */; };
 		3F2C104560B039BE02B1BF16 /* PacketPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 68EA03C5FB3048D3852C8746 /* PacketPolicy.swift */; };
 		5DB746FA83006CFE5CFC3A31 /* KekkaiLocalNodeTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB7A2ECA194D949205657A63 /* KekkaiLocalNodeTransport.swift */; };
-		991FED2E9FFCC465BCBA12E8 /* KekkaiTunnelExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 0BDE8BAD35532FB40DF7EA00 /* KekkaiTunnelExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		60D945D012482874DC4BA3E1 /* KekkaiTunnelExtension.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = A600C6B444648E6D2F7F8068 /* KekkaiTunnelExtension.systemextension */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		A89CC09D871552D8B412E488 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7C131BA846F1EF02D3243078 /* NetworkExtension.framework */; };
 		CE2F8B5A88F253F7C0EA3F4D /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E7F1BE8EE371C57AB79E9C68 /* Network.framework */; };
 		CFEE06F601D3D409F01027D3 /* PacketTunnelProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E6909B40C29C909E84D61B6 /* PacketTunnelProvider.swift */; };
+		D37CEE029FB9776FE02CD05D /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = C446567E5003C675BCB955FF /* main.swift */; };
 		E7C3D852FAD5A8AC12C19F3A /* KekkaiTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99BD8A1AA6DC9EE92D50CECD /* KekkaiTransport.swift */; };
+		F52C5B571B9E190C651A2BAC /* SystemExtensions.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5E5AF0EF8D96299A580E9662 /* SystemExtensions.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -28,28 +30,30 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
-		051B09DC844C44123538D08A /* Embed Foundation Extensions */ = {
+		0B4820C2CEA80C08663FBAFE /* Embed System Extensions */ = {
 			isa = PBXCopyFilesBuildPhase;
 			buildActionMask = 2147483647;
-			dstPath = "";
-			dstSubfolderSpec = 13;
+			dstPath = "$(SYSTEM_EXTENSIONS_FOLDER_PATH)";
+			dstSubfolderSpec = 16;
 			files = (
-				991FED2E9FFCC465BCBA12E8 /* KekkaiTunnelExtension.appex in Embed Foundation Extensions */,
+				60D945D012482874DC4BA3E1 /* KekkaiTunnelExtension.systemextension in Embed System Extensions */,
 			);
-			name = "Embed Foundation Extensions";
+			name = "Embed System Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		01E55279CDC849D2F53B88A1 /* KekkaiTunnelHost.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = KekkaiTunnelHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		0BDE8BAD35532FB40DF7EA00 /* KekkaiTunnelExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = KekkaiTunnelExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		24A553DCFC1AA8200860C060 /* KekkaiTunnelHost.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = KekkaiTunnelHost.entitlements; sourceTree = "<group>"; };
+		5E5AF0EF8D96299A580E9662 /* SystemExtensions.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemExtensions.framework; path = System/Library/Frameworks/SystemExtensions.framework; sourceTree = SDKROOT; };
 		68EA03C5FB3048D3852C8746 /* PacketPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketPolicy.swift; sourceTree = "<group>"; };
 		79A430CFB65B6F0E84CED273 /* KekkaiTunnelHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KekkaiTunnelHost.swift; sourceTree = "<group>"; };
 		7C131BA846F1EF02D3243078 /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = System/Library/Frameworks/NetworkExtension.framework; sourceTree = SDKROOT; };
 		99BD8A1AA6DC9EE92D50CECD /* KekkaiTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KekkaiTransport.swift; sourceTree = "<group>"; };
 		9E6909B40C29C909E84D61B6 /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
+		A600C6B444648E6D2F7F8068 /* KekkaiTunnelExtension.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = KekkaiTunnelExtension.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
+		C446567E5003C675BCB955FF /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		CB7A2ECA194D949205657A63 /* KekkaiLocalNodeTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KekkaiLocalNodeTransport.swift; sourceTree = "<group>"; };
 		E7F1BE8EE371C57AB79E9C68 /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = System/Library/Frameworks/Network.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
@@ -61,6 +65,14 @@
 			files = (
 				CE2F8B5A88F253F7C0EA3F4D /* Network.framework in Frameworks */,
 				A89CC09D871552D8B412E488 /* NetworkExtension.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		966F6700431AAA91F6A4304F /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F52C5B571B9E190C651A2BAC /* SystemExtensions.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -89,7 +101,7 @@
 		2868791CAE21BA50EEDF3EB3 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				0BDE8BAD35532FB40DF7EA00 /* KekkaiTunnelExtension.appex */,
+				A600C6B444648E6D2F7F8068 /* KekkaiTunnelExtension.systemextension */,
 				01E55279CDC849D2F53B88A1 /* KekkaiTunnelHost.app */,
 			);
 			name = Products;
@@ -100,6 +112,7 @@
 			children = (
 				CB7A2ECA194D949205657A63 /* KekkaiLocalNodeTransport.swift */,
 				99BD8A1AA6DC9EE92D50CECD /* KekkaiTransport.swift */,
+				C446567E5003C675BCB955FF /* main.swift */,
 				68EA03C5FB3048D3852C8746 /* PacketPolicy.swift */,
 				9E6909B40C29C909E84D61B6 /* PacketTunnelProvider.swift */,
 			);
@@ -119,6 +132,7 @@
 			children = (
 				E7F1BE8EE371C57AB79E9C68 /* Network.framework */,
 				7C131BA846F1EF02D3243078 /* NetworkExtension.framework */,
+				5E5AF0EF8D96299A580E9662 /* SystemExtensions.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -131,7 +145,8 @@
 			buildConfigurationList = FF4920EBA3AE88247E50DEA6 /* Build configuration list for PBXNativeTarget "KekkaiTunnelHost" */;
 			buildPhases = (
 				CEE1E96BA2969C1D892B44C2 /* Sources */,
-				051B09DC844C44123538D08A /* Embed Foundation Extensions */,
+				966F6700431AAA91F6A4304F /* Frameworks */,
+				0B4820C2CEA80C08663FBAFE /* Embed System Extensions */,
 			);
 			buildRules = (
 			);
@@ -161,8 +176,8 @@
 			packageProductDependencies = (
 			);
 			productName = KekkaiTunnelExtension;
-			productReference = 0BDE8BAD35532FB40DF7EA00 /* KekkaiTunnelExtension.appex */;
-			productType = "com.apple.product-type.app-extension";
+			productReference = A600C6B444648E6D2F7F8068 /* KekkaiTunnelExtension.systemextension */;
+			productType = "com.apple.product-type.system-extension";
 		};
 /* End PBXNativeTarget section */
 
@@ -234,6 +249,7 @@
 				E7C3D852FAD5A8AC12C19F3A /* KekkaiTransport.swift in Sources */,
 				3F2C104560B039BE02B1BF16 /* PacketPolicy.swift in Sources */,
 				CFEE06F601D3D409F01027D3 /* PacketTunnelProvider.swift in Sources */,
+				D37CEE029FB9776FE02CD05D /* main.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -392,6 +408,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Kekkai;
 				INFOPLIST_KEY_LSUIElement = YES;
+				INFOPLIST_KEY_NSSystemExtensionUsageDescription = "Kekkai installs a system packet-tunnel extension to route authorized Kekkai peer traffic.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -414,7 +431,6 @@
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
-					"@executable_path/../../../../Frameworks",
 				);
 				LIBRARY_SEARCH_PATHS = (
 					"$(PROJECT_DIR)/build/packet-plane-apple",
@@ -424,7 +440,7 @@
 					"-lKekkaiPacketPlane",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = jp.kotoba.kekkai.tunnel;
-				PRODUCT_NAME = KekkaiTunnelExtension;
+				PRODUCT_NAME = "$(PRODUCT_BUNDLE_IDENTIFIER)";
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
 			};
@@ -441,6 +457,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Kekkai;
 				INFOPLIST_KEY_LSUIElement = YES;
+				INFOPLIST_KEY_NSSystemExtensionUsageDescription = "Kekkai installs a system packet-tunnel extension to route authorized Kekkai peer traffic.";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -463,7 +480,6 @@
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
-					"@executable_path/../../../../Frameworks",
 				);
 				LIBRARY_SEARCH_PATHS = (
 					"$(PROJECT_DIR)/build/packet-plane-apple",
@@ -473,7 +489,7 @@
 					"-lKekkaiPacketPlane",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = jp.kotoba.kekkai.tunnel;
-				PRODUCT_NAME = KekkaiTunnelExtension;
+				PRODUCT_NAME = "$(PRODUCT_BUNDLE_IDENTIFIER)";
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
 			};

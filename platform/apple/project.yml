@@ -19,18 +19,20 @@ targets:
     dependencies:
       - target: KekkaiTunnelExtension
         embed: true
+      - sdk: SystemExtensions.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: jp.kotoba.kekkai
         PRODUCT_NAME: KekkaiTunnel
         INFOPLIST_KEY_CFBundleDisplayName: Kekkai
         INFOPLIST_KEY_LSUIElement: YES
+        INFOPLIST_KEY_NSSystemExtensionUsageDescription: Kekkai installs a system packet-tunnel extension to route authorized Kekkai peer traffic.
         GENERATE_INFOPLIST_FILE: YES
         ENABLE_HARDENED_RUNTIME: YES
         ENABLE_APP_SANDBOX: YES
         CODE_SIGN_ENTITLEMENTS: KekkaiTunnelHost/KekkaiTunnelHost.entitlements
   KekkaiTunnelExtension:
-    type: app-extension
+    type: system-extension
     platform: macOS
     sources:
       - path: Sources/KekkaiTunnel
@@ -40,7 +42,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: jp.kotoba.kekkai.tunnel
-        PRODUCT_NAME: KekkaiTunnelExtension
+        PRODUCT_NAME: $(PRODUCT_BUNDLE_IDENTIFIER)
         INFOPLIST_FILE: KekkaiTunnelExtension/Info.plist
         GENERATE_INFOPLIST_FILE: YES
         CODE_SIGN_ENTITLEMENTS: KekkaiTunnel.entitlements
