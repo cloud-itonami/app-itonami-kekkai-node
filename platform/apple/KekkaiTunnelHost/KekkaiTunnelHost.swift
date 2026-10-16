@@ -17,7 +17,17 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
     private var extensionConnection: NSXPCConnection?
     private let bridgeLock = NSLock()
     private var nodeTransport: KekkaiLocalNodeTransport?
-    private var waitingForTunnelStopBeforeTermination = false
+    private var nodeTransportOwner: NSXPCConnection?
+    private var nodeTransportStopInFlight = false
+    private var nodeTransportStopOwner: NSXPCConnection?
+    private var nodeTransportStopCompletions: [() -> Void] = []
+    private var pendingBridgeStarts: [(
+        configuration: [String: Any],
+        originConnection: NSXPCConnection,
+        reply: (NSError?) -> Void
+    )] = []
+    private var terminationInProgress = false
+    private var terminationCleanupStarted = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -29,41 +39,62 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
             queue: .main
         ) { [weak self] _ in
             self?.refreshMenu()
-            self?.completeTerminationIfTunnelStopped()
+            self?.finishTerminationIfTunnelStopped()
         }
         loadManager { [weak self] in self?.refreshMenu() }
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        removeStatusObserver()
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if waitingForTunnelStopBeforeTermination { return .terminateLater }
-        guard let connection = manager?.connection,
-              connection.status != .invalid,
-              connection.status != .disconnected else {
-            return .terminateNow
+        bridgeLock.lock()
+        terminationInProgress = true
+        bridgeLock.unlock()
+        switch manager?.connection.status ?? .invalid {
+        case .connected, .connecting, .reasserting:
+            manager?.connection.stopVPNTunnel()
+        case .disconnecting:
+            break
+        case .invalid, .disconnected:
+            finishTerminationIfTunnelStopped()
+        @unknown default:
+            manager?.connection.stopVPNTunnel()
         }
-        waitingForTunnelStopBeforeTermination = true
-        connection.stopVPNTunnel()
         return .terminateLater
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        if let statusObserver {
-            NotificationCenter.default.removeObserver(statusObserver)
+    private func finishTerminationIfTunnelStopped() {
+        bridgeLock.lock()
+        let isTerminating = terminationInProgress
+        bridgeLock.unlock()
+        guard isTerminating, !terminationCleanupStarted else { return }
+        switch manager?.connection.status ?? .invalid {
+        case .connected, .connecting, .reasserting, .disconnecting:
+            return
+        case .invalid, .disconnected:
+            break
+        @unknown default:
+            return
         }
-        stopNodeTransport()
-        extensionConnectionLock.lock()
-        let extensionConnection = self.extensionConnection
-        self.extensionConnection = nil
-        extensionConnectionLock.unlock()
-        extensionConnection?.invalidate()
+        terminationCleanupStarted = true
+        stopNodeTransport { [weak self] in
+            guard let self else { return }
+            self.extensionConnectionLock.lock()
+            let connection = self.extensionConnection
+            self.extensionConnection = nil
+            self.extensionConnectionLock.unlock()
+            connection?.invalidate()
+            self.removeStatusObserver()
+            DispatchQueue.main.async { NSApp.reply(toApplicationShouldTerminate: true) }
+        }
     }
 
-    private func completeTerminationIfTunnelStopped() {
-        guard waitingForTunnelStopBeforeTermination,
-              let status = manager?.connection.status,
-              status == .invalid || status == .disconnected else { return }
-        waitingForTunnelStopBeforeTermination = false
-        NSApp.reply(toApplicationShouldTerminate: true)
+    private func removeStatusObserver() {
+        guard let statusObserver else { return }
+        NotificationCenter.default.removeObserver(statusObserver)
+        self.statusObserver = nil
     }
 
     @objc private func connect(_ sender: Any?) {
@@ -132,8 +163,8 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
         extensionConnectionLock.lock()
         let existingConnection = extensionConnection
         extensionConnectionLock.unlock()
-        if existingConnection != nil {
-            completion(nil)
+        if let existingConnection {
+            ping(existingConnection, completion: completion)
             return
         }
         let serviceName = Bundle.main.object(forInfoDictionaryKey: "KekkaiMachServiceName") as? String
@@ -160,7 +191,7 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
                 self.extensionConnection = nil
             }
             self.extensionConnectionLock.unlock()
-            if wasCurrent { self.stopNodeTransport() }
+            if wasCurrent { self.stopNodeTransport(from: connection) }
         }
         connection.interruptionHandler = { [weak self, weak connection] in
             guard let self, let connection else { return }
@@ -168,14 +199,19 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
             let isCurrent = self.extensionConnection === connection
             if isCurrent { self.extensionConnection = nil }
             self.extensionConnectionLock.unlock()
-            guard isCurrent else { return }
-            connection.invalidate()
-            self.stopNodeTransport()
+            if isCurrent {
+                connection.invalidate()
+                self.stopNodeTransport(from: connection)
+            }
         }
         extensionConnectionLock.lock()
         extensionConnection = connection
         extensionConnectionLock.unlock()
         connection.resume()
+        ping(connection, completion: completion)
+    }
+
+    private func ping(_ connection: NSXPCConnection, completion: @escaping (Error?) -> Void) {
         let completionLock = NSLock()
         var didComplete = false
         let completeOnce: (Error?) -> Void = { [weak self, weak connection] error in
@@ -188,8 +224,10 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
             completionLock.unlock()
             if error != nil, let self, let connection {
                 self.extensionConnectionLock.lock()
-                if self.extensionConnection === connection { self.extensionConnection = nil }
+                let wasCurrent = self.extensionConnection === connection
+                if wasCurrent { self.extensionConnection = nil }
                 self.extensionConnectionLock.unlock()
+                if wasCurrent { self.stopNodeTransport(from: connection) }
                 connection.invalidate()
             }
             DispatchQueue.main.async { completion(error) }
@@ -209,12 +247,39 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
     }
 
     func startPacketBridge(configuration: Data, withReply reply: @escaping (NSError?) -> Void) {
+        guard let originConnection = NSXPCConnection.current() else {
+            reply(NSError(domain: "jp.kotoba.kekkai.bridge", code: 16,
+                          userInfo: [NSLocalizedDescriptionKey: "Kekkai bridge request has no XPC peer"]))
+            return
+        }
         guard let configuration = try? JSONSerialization.jsonObject(with: configuration) as? [String: Any] else {
             reply(NSError(domain: "jp.kotoba.kekkai.bridge", code: 12,
                           userInfo: [NSLocalizedDescriptionKey: "Kekkai packet bridge configuration is invalid"]))
             return
         }
+        guard isCurrentExtensionConnection(originConnection) else {
+            reply(NSError(domain: "jp.kotoba.kekkai.bridge", code: 17,
+                          userInfo: [NSLocalizedDescriptionKey: "Kekkai bridge request came from a stale XPC peer"]))
+            return
+        }
         bridgeLock.lock()
+        guard isCurrentExtensionConnection(originConnection) else {
+            bridgeLock.unlock()
+            reply(NSError(domain: "jp.kotoba.kekkai.bridge", code: 17,
+                          userInfo: [NSLocalizedDescriptionKey: "Kekkai bridge request came from a stale XPC peer"]))
+            return
+        }
+        if terminationInProgress {
+            bridgeLock.unlock()
+            reply(NSError(domain: "jp.kotoba.kekkai.bridge", code: 19,
+                          userInfo: [NSLocalizedDescriptionKey: "Kekkai host is shutting down"]))
+            return
+        }
+        if nodeTransportStopInFlight {
+            pendingBridgeStarts.append((configuration, originConnection, reply))
+            bridgeLock.unlock()
+            return
+        }
         guard nodeTransport == nil else {
             bridgeLock.unlock()
             reply(NSError(domain: "jp.kotoba.kekkai.bridge", code: 13,
@@ -223,8 +288,17 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
         }
         let transport = KekkaiLocalNodeTransport()
         nodeTransport = transport
+        nodeTransportOwner = originConnection
         bridgeLock.unlock()
 
+        startNodeTransport(transport, configuration: configuration, reply: reply)
+    }
+
+    private func startNodeTransport(
+        _ transport: KekkaiLocalNodeTransport,
+        configuration: [String: Any],
+        reply: @escaping (NSError?) -> Void
+    ) {
         transport.start(
             configuration: configuration,
             receive: { [weak self] packet, family in
@@ -288,9 +362,18 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
     }
 
     func stopPacketBridge(withReply reply: @escaping (NSError?) -> Void) {
-        stopNodeTransport {
+        guard let originConnection = NSXPCConnection.current(),
+              isCurrentExtensionConnection(originConnection) else {
             reply(nil)
+            return
         }
+        stopNodeTransport(from: originConnection) { reply(nil) }
+    }
+
+    private func isCurrentExtensionConnection(_ candidate: NSXPCConnection) -> Bool {
+        extensionConnectionLock.lock()
+        defer { extensionConnectionLock.unlock() }
+        return extensionConnection === candidate
     }
 
     private func extensionProxy() -> KekkaiTunnelExtensionProtocol? {
@@ -304,23 +387,100 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
             let isCurrent = self.extensionConnection === connection
             self.extensionConnectionLock.unlock()
             guard isCurrent else { return }
-            self.stopNodeTransport()
+            self.stopNodeTransport(from: connection)
             DispatchQueue.main.async {
                 self.showError("Kekkai system extension connection failed", error)
             }
         } as? KekkaiTunnelExtensionProtocol
     }
 
-    private func stopNodeTransport(completion: @escaping () -> Void = {}) {
+    private func stopNodeTransport(
+        from originConnection: NSXPCConnection? = nil,
+        completion: @escaping () -> Void = {}
+    ) {
         bridgeLock.lock()
-        let transport = nodeTransport
-        nodeTransport = nil
-        bridgeLock.unlock()
-        guard let transport else {
+        if nodeTransportStopInFlight {
+            let ownsStoppingTransport = originConnection == nil || nodeTransportStopOwner === originConnection
+            let cancelledStarts: [(
+                configuration: [String: Any],
+                originConnection: NSXPCConnection,
+                reply: (NSError?) -> Void
+            )]
+            if let originConnection {
+                cancelledStarts = pendingBridgeStarts.filter { $0.originConnection === originConnection }
+                pendingBridgeStarts.removeAll { $0.originConnection === originConnection }
+            } else {
+                cancelledStarts = pendingBridgeStarts
+                pendingBridgeStarts.removeAll(keepingCapacity: false)
+            }
+            guard ownsStoppingTransport || !cancelledStarts.isEmpty else {
+                bridgeLock.unlock()
+                completion()
+                return
+            }
+            nodeTransportStopCompletions.append(completion)
+            bridgeLock.unlock()
+            cancelledStarts.forEach {
+                $0.reply(NSError(domain: "jp.kotoba.kekkai.bridge", code: 18,
+                                 userInfo: [NSLocalizedDescriptionKey: "Kekkai bridge start was superseded by a stop"]))
+            }
+            return
+        }
+        if let originConnection, nodeTransportOwner !== originConnection {
+            bridgeLock.unlock()
             completion()
             return
         }
-        transport.stop(completion: completion)
+        let transport = nodeTransport
+        guard let transport else {
+            bridgeLock.unlock()
+            completion()
+            return
+        }
+        nodeTransport = nil
+        nodeTransportStopOwner = nodeTransportOwner
+        nodeTransportOwner = nil
+        nodeTransportStopInFlight = true
+        nodeTransportStopCompletions.append(completion)
+        bridgeLock.unlock()
+        transport.stop { [weak self] in
+            guard let self else { return }
+            self.bridgeLock.lock()
+            let pendingStarts = self.pendingBridgeStarts
+            self.pendingBridgeStarts.removeAll(keepingCapacity: false)
+            var rejectedStarts: [((NSError?) -> Void, NSError)] = []
+            for pending in pendingStarts {
+                guard !self.terminationInProgress else {
+                    rejectedStarts.append((pending.reply, NSError(
+                        domain: "jp.kotoba.kekkai.bridge", code: 19,
+                        userInfo: [NSLocalizedDescriptionKey: "Kekkai host is shutting down"])))
+                    continue
+                }
+                guard self.isCurrentExtensionConnection(pending.originConnection) else {
+                    rejectedStarts.append((pending.reply, NSError(
+                        domain: "jp.kotoba.kekkai.bridge", code: 17,
+                        userInfo: [NSLocalizedDescriptionKey: "Kekkai bridge request came from a stale XPC peer"])))
+                    continue
+                }
+                guard self.nodeTransport == nil else {
+                    rejectedStarts.append((pending.reply, NSError(
+                        domain: "jp.kotoba.kekkai.bridge", code: 13,
+                        userInfo: [NSLocalizedDescriptionKey: "Kekkai packet bridge is already running"])))
+                    continue
+                }
+                let nextTransport = KekkaiLocalNodeTransport()
+                self.nodeTransport = nextTransport
+                self.nodeTransportOwner = pending.originConnection
+                self.startNodeTransport(nextTransport, configuration: pending.configuration, reply: pending.reply)
+            }
+            self.nodeTransportStopOwner = nil
+            self.nodeTransportStopInFlight = false
+            let completions = self.nodeTransportStopCompletions
+            self.nodeTransportStopCompletions.removeAll(keepingCapacity: false)
+            self.bridgeLock.unlock()
+            rejectedStarts.forEach { $0.0($0.1) }
+            completions.forEach { $0() }
+        }
     }
 
     private func activateSystemExtension(completion: @escaping (Error?) -> Void) {
@@ -351,14 +511,14 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
         actionForReplacingExtension existing: OSSystemExtensionProperties,
         withExtension extensionProperties: OSSystemExtensionProperties
     ) -> OSSystemExtensionRequest.ReplacementAction {
-        guard isNotOlderSystemExtension(
+        guard isAtLeastSystemExtensionVersion(
             extensionProperties.bundleVersion,
             than: existing.bundleVersion
         ) else { return .cancel }
         return .replace
     }
 
-    private func isNotOlderSystemExtension(_ candidate: String, than installed: String) -> Bool {
+    private func isAtLeastSystemExtensionVersion(_ candidate: String, than installed: String) -> Bool {
         func components(_ version: String) -> [Int]? {
             let parts = version.split(separator: ".", omittingEmptySubsequences: false)
             guard (1...3).contains(parts.count) else { return nil }
