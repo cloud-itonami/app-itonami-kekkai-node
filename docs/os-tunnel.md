@@ -89,6 +89,8 @@ The XPC service supports one host bridge at a time. It rejects a replacement
 while the provider is attached, and releases the host identity only after the
 host has stopped its socket bridge. Disconnect the active tunnel before
 connecting from another logged-in user's session.
+When quitting the menu-bar host with a tunnel active, it waits for VPN teardown
+and underlay release before closing the bridge and XPC connection.
 
 `platform/apple/project.yml` generates a macOS menu-bar host app and embeds
 `jp.kotoba.kekkai.tunnel.systemextension` in

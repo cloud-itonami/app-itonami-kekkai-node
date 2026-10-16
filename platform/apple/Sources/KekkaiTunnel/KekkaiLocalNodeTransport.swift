@@ -153,9 +153,20 @@ public final class KekkaiLocalNodeTransport: KekkaiPacketTransport {
             self.input.removeAll(keepingCapacity: false)
             let connection = self.connection
             self.connection = nil
-            connection?.stateUpdateHandler = nil
-            connection?.cancel()
-            completion()
+            guard let connection else {
+                completion()
+                return
+            }
+            if case .cancelled = connection.state {
+                completion()
+                return
+            }
+            connection.stateUpdateHandler = { [weak connection] state in
+                guard case .cancelled = state else { return }
+                connection?.stateUpdateHandler = nil
+                completion()
+            }
+            connection.cancel()
         }
     }
 

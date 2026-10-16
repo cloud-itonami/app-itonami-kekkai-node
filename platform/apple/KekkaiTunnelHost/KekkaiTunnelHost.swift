@@ -17,6 +17,7 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
     private var extensionConnection: NSXPCConnection?
     private let bridgeLock = NSLock()
     private var nodeTransport: KekkaiLocalNodeTransport?
+    private var waitingForTunnelStopBeforeTermination = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -28,21 +29,41 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
             queue: .main
         ) { [weak self] _ in
             self?.refreshMenu()
+            self?.completeTerminationIfTunnelStopped()
         }
         loadManager { [weak self] in self?.refreshMenu() }
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if waitingForTunnelStopBeforeTermination { return .terminateLater }
+        guard let connection = manager?.connection,
+              connection.status != .invalid,
+              connection.status != .disconnected else {
+            return .terminateNow
+        }
+        waitingForTunnelStopBeforeTermination = true
+        connection.stopVPNTunnel()
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         if let statusObserver {
             NotificationCenter.default.removeObserver(statusObserver)
         }
-        manager?.connection.stopVPNTunnel()
         stopNodeTransport()
         extensionConnectionLock.lock()
         let extensionConnection = self.extensionConnection
         self.extensionConnection = nil
         extensionConnectionLock.unlock()
         extensionConnection?.invalidate()
+    }
+
+    private func completeTerminationIfTunnelStopped() {
+        guard waitingForTunnelStopBeforeTermination,
+              let status = manager?.connection.status,
+              status == .invalid || status == .disconnected else { return }
+        waitingForTunnelStopBeforeTermination = false
+        NSApp.reply(toApplicationShouldTerminate: true)
     }
 
     @objc private func connect(_ sender: Any?) {
@@ -145,8 +166,11 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
             guard let self, let connection else { return }
             self.extensionConnectionLock.lock()
             let isCurrent = self.extensionConnection === connection
+            if isCurrent { self.extensionConnection = nil }
             self.extensionConnectionLock.unlock()
-            if isCurrent { self.stopNodeTransport() }
+            guard isCurrent else { return }
+            connection.invalidate()
+            self.stopNodeTransport()
         }
         extensionConnectionLock.lock()
         extensionConnection = connection
@@ -327,14 +351,14 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
         actionForReplacingExtension existing: OSSystemExtensionProperties,
         withExtension extensionProperties: OSSystemExtensionProperties
     ) -> OSSystemExtensionRequest.ReplacementAction {
-        guard isNewerSystemExtension(
+        guard isNotOlderSystemExtension(
             extensionProperties.bundleVersion,
             than: existing.bundleVersion
         ) else { return .cancel }
         return .replace
     }
 
-    private func isNewerSystemExtension(_ candidate: String, than installed: String) -> Bool {
+    private func isNotOlderSystemExtension(_ candidate: String, than installed: String) -> Bool {
         func components(_ version: String) -> [Int]? {
             let parts = version.split(separator: ".", omittingEmptySubsequences: false)
             guard (1...3).contains(parts.count) else { return nil }
@@ -349,7 +373,7 @@ final class KekkaiTunnelHost: NSObject, NSApplicationDelegate, OSSystemExtension
             let installedPart = index < installed.count ? installed[index] : 0
             if candidatePart != installedPart { return candidatePart > installedPart }
         }
-        return false
+        return true
     }
 
     func request(

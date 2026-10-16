@@ -160,11 +160,36 @@ final class KekkaiSystemExtensionXPCService: NSObject, NSXPCListenerDelegate {
     }
 
     func releaseUnderlayGuard(completion: @escaping () -> Void) {
-        guard let proxy = hostProxy() else {
+        lock.lock()
+        let connection = self.connection
+        lock.unlock()
+        guard let connection else {
             completion()
             return
         }
-        proxy.releaseUnderlayGuard { _ in completion() }
+
+        let completionLock = NSLock()
+        var didComplete = false
+        let completeOnce = {
+            completionLock.lock()
+            guard !didComplete else {
+                completionLock.unlock()
+                return
+            }
+            didComplete = true
+            completionLock.unlock()
+            completion()
+        }
+        guard let proxy = connection.remoteObjectProxyWithErrorHandler({ [weak self, weak connection] error in
+            if let self, let connection, self.isCurrent(connection) {
+                self.failActiveTransport(error)
+            }
+            completeOnce()
+        }) as? KekkaiTunnelHostProtocol else {
+            completeOnce()
+            return
+        }
+        proxy.releaseUnderlayGuard { _ in completeOnce() }
     }
 
     func stopPacketBridge(completion: @escaping () -> Void) {
