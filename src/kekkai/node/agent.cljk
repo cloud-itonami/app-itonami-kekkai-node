@@ -82,6 +82,7 @@
      :relay nil           ; relay client state
      :relay-pool (netmap/relays nm) ; signed priority order for failover
      :relay-index 0
+     :stopping? false
      :local-candidates []
      :heartbeat {:enabled? (boolean (:heartbeat config))
                  :sequence 0
@@ -585,12 +586,19 @@
             ;; silently swallow the packet: an exception here previously lost a
             ;; relay handshake response with no trace of why (found in the E2E).
             :on-message (fn [bytes from]
-                          (try
-                            (swap! st on-datagram bytes from on-event)
-                            (catch :default e
-                              (on-event {:event :handler-error :from from
-                                         :reason (ex-message e)
-                                         :stack (some-> e .-stack)}))))})
+                          ;; A datagram may already be queued when the caller
+                          ;; stops this agent. In particular, a peer can send a
+                          ;; final ping while `kekkai ssh` is tearing down its
+                          ;; temporary socket. Do not answer after stop has
+                          ;; begun: the UDP socket is closed below, and sending
+                          ;; on it raises ERR_SOCKET_DGRAM_NOT_RUNNING.
+                          (when-not (:stopping? @st)
+                            (try
+                              (swap! st on-datagram bytes from on-event)
+                              (catch :default e
+                                (on-event {:event :handler-error :from from
+                                           :reason (ex-message e)
+                                           :stack (some-> e .-stack)})))))})
           (.then
            (fn [sock]
              (swap! st assoc :sock sock)
@@ -642,12 +650,14 @@
                    base {:state st
                          :status #(status @st)
                          :stop (fn []
-                                 (js/clearInterval timer)
-                                 (js/clearInterval netmap-timer)
-                                 (when heartbeat-timer
-                                   (js/clearInterval heartbeat-timer))
-                                 (udp/close! sock)
-                                 (on-event {:event :stopped}))}]
+                                 (when-not (:stopping? @st)
+                                   (swap! st assoc :stopping? true)
+                                   (js/clearInterval timer)
+                                   (js/clearInterval netmap-timer)
+                                   (when heartbeat-timer
+                                     (js/clearInterval heartbeat-timer))
+                                   (udp/close! sock)
+                                   (on-event {:event :stopped})))}]
                (if-not (get-in config [:dns :enabled?])
                  base
                  ;; await the DNS listener so the caller gets its actual port —
