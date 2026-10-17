@@ -5,6 +5,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 verification_root="${KEKKAI_VERIFICATION_ROOT:-/Users/junkawasaki/github/workspaces/codex}"
 kotoba_root="${KOTOBALANG_ROOT:-$(cd "$repo_root/../../../../kotoba-lang" && pwd)}"
 amu_root="$kotoba_root/amu"
+KBB_HOME="${KBB_HOME:-$amu_root}"
+KBB_ENGINE="${KBB_ENGINE:-$KBB_HOME/node_modules/nbb/cli.js}"
 mkdir -p "$verification_root"
 test_root="$(mktemp -d "$verification_root/k-XXXXXX")"
 chmod 700 "$test_root"
@@ -21,6 +23,6 @@ classpath="$repo_root/src:$repo_root/test:$kotoba_root/bytes/src:$kotoba_root/no
 cd "$repo_root"
 TMPDIR="$test_root" \
 KEKKAI_APPLE_PACKET_TRANSPORT_HARNESS="$swift_binary" \
-KBB_HOME="$amu_root" \
-KBB_ENGINE="$amu_root/node_modules/nbb/cli.js" \
+KBB_HOME="$KBB_HOME" \
+KBB_ENGINE="$KBB_ENGINE" \
 kbb --backend sci --classpath "$classpath" test/tun_e2e.cljk
