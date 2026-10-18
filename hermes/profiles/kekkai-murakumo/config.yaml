@@ -1,5 +1,5 @@
 model:
+  max_tokens: 8192
   provider: murakumo
   default: mishima
-  max_tokens: 8192
-  context_length: 131072
+_config_version: 51
